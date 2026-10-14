@@ -1,4 +1,4 @@
-import { translate } from './translation.js';
+import { translate, translateItems } from './translation.js';
 import { GitHubFailure, getInstallationToken, github, findBotComment, findBotReviewComment } from './github.js';
 
 const GITHUB_API = 'https://api.github.com';
@@ -203,6 +203,7 @@ function renderTranslation(job, translated, truncated, source) {
 
 export async function processContentJob(job, env, options = {}) {
   if (!SOURCE_KINDS.has(job.kind)) throw new Error('Invalid content translation kind');
+  if (job.version === 4) return processNativeReviewJob(job, env, options);
   const { owner, repo, number, installationId, kind } = job;
   const paths = pathsFor(job);
   const token = await getInstallationToken(env, installationId, { requirePullRequestsWrite: kind === 'review_comment' });
@@ -279,4 +280,216 @@ export async function processContentJob(job, env, options = {}) {
     await github(token, `/repos/${owner}/${repo}/issues/${number}/comments`, 'POST', { body: comment.body });
     console.info('Content translation comment created');
   }
+}
+
+const nativeReviewMarker = id => `<!-- pr-translator-bot:review:v2:${id} -->`;
+const nativeCommentMarker = id => `<!-- pr-translator-bot:review-comment:v2:${id} -->`;
+const nativeReplyMarker = id => `<!-- pr-translator-bot:review-reply:v1:${id} -->`;
+
+async function listAll(token, path) {
+  const results = [];
+  for (let page = 1; page <= 5; page++) {
+    const values = await github(token, `${path}?per_page=100&page=${page}`);
+    if (!Array.isArray(values)) throw new GitHubFailure('GitHub review list: invalid response', true);
+    results.push(...values);
+    if (values.length < 100) return results;
+  }
+  throw new GitHubFailure('Review lookup exceeds 500 entries', false);
+}
+
+async function sourceHash(source) {
+  const value = JSON.stringify({ id: source.id, body: text(source.body), author: text(source.user?.login),
+    commit: source.commit_id, originalCommit: source.original_commit_id, path: source.path,
+    line: source.line, startLine: source.start_line, originalLine: source.original_line,
+    originalStartLine: source.original_start_line, side: source.side, startSide: source.start_side,
+    reply: source.in_reply_to_id, review: source.pull_request_review_id });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function addHash(body, hash) {
+  return body.replace('\n', `\n<!-- pr-translator-bot:source:v1:${hash} -->\n`);
+}
+
+function hasHash(body, hash) {
+  return text(body).split('\n')[1] === `<!-- pr-translator-bot:source:v1:${hash} -->`;
+}
+
+async function readNativeSnapshot(token, job, env) {
+  const base = `/repos/${job.owner}/${job.repo}`;
+  if (!repositoryEligible(await github(token, base), env)) return null;
+  const container = await getIfPresent(token, `${base}/pulls/${job.number}`);
+  if (!containerEligible(container, job, env)) return null;
+  const review = await getIfPresent(token, `${base}/pulls/${job.number}/reviews/${job.sourceId}`);
+  if (!sourceMatches(review, job) || isOwnTranslation(review, env)
+    || String(review.state).toUpperCase() === 'PENDING') return null;
+  if (!/^[a-f0-9]{40}$/i.test(text(review.commit_id))) {
+    throw new GitHubFailure('Source review has no valid reviewed commit', false);
+  }
+  const values = await listAll(token, `${base}/pulls/${job.number}/reviews/${job.sourceId}/comments`);
+  const roots = [];
+  for (const source of values) {
+    if (!positiveId(source.id) || !sourceMatches(source, { ...job, kind: 'review_comment', sourceId: source.id })
+      || source.pull_request_review_id !== job.sourceId) {
+      throw new GitHubFailure('Source review comment association is invalid', false);
+    }
+    if (!positiveId(source.in_reply_to_id) && !isOwnTranslation(source, env) && text(source.body).trim()) roots.push(source);
+  }
+  roots.sort((a, b) => a.id - b.id);
+  if (roots.length > 100) throw new GitHubFailure('Source review exceeds 100 inline comments', false);
+  return { review, roots };
+}
+
+async function snapshotKey(snapshot) {
+  return JSON.stringify([await sourceHash(snapshot.review), ...await Promise.all(snapshot.roots.map(sourceHash))]);
+}
+
+async function nativeTranslations(token, job, env) {
+  const base = `/repos/${job.owner}/${job.repo}/pulls/${job.number}`;
+  const reviews = (await listAll(token, `${base}/reviews`)).filter(review => review.user?.type === 'Bot'
+    && (text(review.body).startsWith(nativeReviewMarker(job.sourceId))
+      || text(review.body).startsWith(`<!-- pr-translator-bot:review-supplement:v1:${job.sourceId}:`)));
+  const comments = new Map();
+  for (const review of reviews) {
+    const reviewAppId = review.performed_via_github_app?.id;
+    if (!positiveId(review.id) || !sourceMatches(review, { ...job, kind: 'review', sourceId: review.id })
+      || (reviewAppId !== undefined && String(reviewAppId) !== String(env.GITHUB_APP_ID))) {
+      throw new GitHubFailure('Translation review association is invalid', false);
+    }
+    for (const comment of await listAll(token, `${base}/reviews/${review.id}/comments`)) {
+      if (comment.user?.type !== 'Bot' || positiveId(comment.in_reply_to_id)) continue;
+      const match = text(comment.body).match(/^<!-- pr-translator-bot:review-comment:v2:(\d+) -->\n/);
+      if (match) {
+        const commentAppId = comment.performed_via_github_app?.id;
+        if (!positiveId(comment.id) || comment.pull_request_review_id !== review.id
+          || !positiveId(Number(match[1]))
+          || !sourceMatches(comment, { ...job, kind: 'review_comment', sourceId: comment.id })
+          || (commentAppId !== undefined && String(commentAppId) !== String(env.GITHUB_APP_ID))) {
+          throw new GitHubFailure('Translation review comment association is invalid', false);
+        }
+        comments.set(Number(match[1]), comment);
+      }
+    }
+  }
+  return { reviews, comments, main: reviews.find(review => text(review.body).startsWith(nativeReviewMarker(job.sourceId))) };
+}
+
+function renderNativeReview(job, source, translated, hash) {
+  const rendered = translated
+    ? renderTranslation(job, translated, text(source.body).length > MAX_CONTENT_CHARS, source).body
+    : `<!-- pr-translator-bot:review:v1:${job.sourceId} -->\n### Automatic review translation\n\n[Original review](https://github.com/${job.owner}/${job.repo}/pull/${job.number}#pullrequestreview-${job.sourceId})${sourceContext(job, source)}\n\n_行内译文见下方 / Inline translations below._`;
+  return addHash(rendered.replace(`<!-- pr-translator-bot:review:v1:${job.sourceId} -->`, nativeReviewMarker(job.sourceId)), hash);
+}
+
+function renderNativeComment(job, source, translated, hash) {
+  const rendered = renderTranslation({ ...job, kind: 'review_comment', sourceId: source.id }, translated,
+    text(source.body).length > MAX_CONTENT_CHARS, source).body;
+  return addHash(rendered.replace(`<!-- pr-translator-bot:review-comment:v1:${source.id} -->`, nativeCommentMarker(source.id)), hash);
+}
+
+function reviewCoordinates(source, commit) {
+  if (source.original_commit_id !== commit || !text(source.path) || !positiveId(source.original_line)
+    || !['LEFT', 'RIGHT'].includes(source.side)) {
+    throw new GitHubFailure('Original review location cannot be copied safely', false);
+  }
+  if (positiveId(source.original_start_line) && (source.original_start_line > source.original_line
+    || (source.original_start_line !== source.original_line && !['LEFT', 'RIGHT'].includes(source.start_side)))) {
+    throw new GitHubFailure('Original review line range cannot be copied safely', false);
+  }
+  return { path: source.path, line: source.original_line, side: source.side,
+    ...(positiveId(source.original_start_line) && source.original_start_line !== source.original_line
+      ? { start_line: source.original_start_line, start_side: source.start_side || source.side } : {}) };
+}
+
+async function syncNativeReview(token, job, env, options) {
+  const snapshot = await readNativeSnapshot(token, job, env);
+  if (!snapshot || (!text(snapshot.review.body).trim() && !snapshot.roots.length)) return null;
+  const state = await nativeTranslations(token, job, env);
+  if (state.reviews.some(review => review.commit_id !== snapshot.review.commit_id)) {
+    throw new GitHubFailure('Translation review commit does not match its source', false);
+  }
+  const reviewHash = await sourceHash(snapshot.review);
+  const hashes = new Map(await Promise.all(snapshot.roots.map(async source => [source.id, await sourceHash(source)])));
+  const needsBody = !state.main || !hasHash(state.main.body, reviewHash);
+  const changedRoots = snapshot.roots.filter(source => !hasHash(state.comments.get(source.id)?.body, hashes.get(source.id)));
+  const items = [
+    ...(needsBody && text(snapshot.review.body).trim() ? [{ id: 'review', title: '', body: text(snapshot.review.body).slice(0, MAX_CONTENT_CHARS) }] : []),
+    ...changedRoots.map(source => ({ id: String(source.id), title: '', body: text(source.body).slice(0, MAX_CONTENT_CHARS) })),
+  ];
+  const translated = new Map((items.length ? await translateItems(env, items, options) : []).map(item => [item.id, item]));
+  const current = await readNativeSnapshot(token, job, env);
+  if (!current) return null;
+  if (await snapshotKey(snapshot) !== await snapshotKey(current)) {
+    throw new GitHubFailure('Original review changed during translation; retrying current text', true);
+  }
+  const base = `/repos/${job.owner}/${job.repo}/pulls/${job.number}`;
+  const body = needsBody ? renderNativeReview(job, current.review, translated.get('review'), reviewHash) : state.main.body;
+  const missingRoots = changedRoots.filter(source => !state.comments.has(source.id));
+  const newComments = missingRoots.map(source => ({ ...reviewCoordinates(source, current.review.commit_id),
+    body: renderNativeComment(job, source, translated.get(String(source.id)), hashes.get(source.id)) }));
+  // COMMENT preserves the original review decision; the bot is providing translations.
+  if (!state.main) {
+    const created = await github(token, `${base}/reviews`, 'POST', { event: 'COMMENT', commit_id: current.review.commit_id, body, comments: newComments });
+    if (!positiveId(created?.id)) throw new GitHubFailure('Created translation review has no valid ID', true);
+    console.info('Native translation review created');
+  } else {
+    if (needsBody && state.main.body !== body) {
+      await github(token, `${base}/reviews/${state.main.id}`, 'PUT', { body });
+      console.info('Native translation review updated');
+    }
+    for (const source of changedRoots.filter(value => state.comments.has(value.id))) {
+      const existing = state.comments.get(source.id);
+      const commentBody = renderNativeComment(job, source, translated.get(String(source.id)), hashes.get(source.id));
+      if (existing.body !== commentBody) await github(token, `/repos/${job.owner}/${job.repo}/pulls/comments/${existing.id}`, 'PATCH', { body: commentBody });
+    }
+    if (newComments.length) {
+      // Submitted Reviews cannot gain new root comments. A delayed source comment
+      // receives a separate, explicitly linked supplement authored by this bot.
+      const suffix = (await sourceHash({ id: job.sourceId, body: missingRoots.map(source => source.id).join(',') })).slice(0, 16);
+      const supplement = `<!-- pr-translator-bot:review-supplement:v1:${job.sourceId}:${suffix} -->\n\n${body}`;
+      await github(token, `${base}/reviews`, 'POST', { event: 'COMMENT', commit_id: current.review.commit_id, body: supplement, comments: newComments });
+      console.info('Native translation review supplement created');
+    }
+  }
+  return nativeTranslations(token, job, env);
+}
+
+async function processNativeReviewJob(job, env, options) {
+  const { owner, repo, number, installationId } = job;
+  const token = await getInstallationToken(env, installationId, { requirePullRequestsWrite: true });
+  if (job.kind === 'review') return syncNativeReview(token, job, env, options);
+  const base = `/repos/${owner}/${repo}`;
+  // Check visibility before fetching or sending any comment text.
+  if (!repositoryEligible(await github(token, base), env)
+    || !containerEligible(await getIfPresent(token, `${base}/pulls/${number}`), job, env)) return;
+  const source = await getIfPresent(token, `${base}/pulls/comments/${job.sourceId}`);
+  if (!source || !eligibleSource(source, job, env)) return;
+  const rootId = positiveId(source.in_reply_to_id) ? source.in_reply_to_id : source.id;
+  const root = rootId === source.id ? source : await getIfPresent(token, `${base}/pulls/comments/${rootId}`);
+  if (!sourceMatches(root, { ...job, sourceId: rootId }) || positiveId(root.in_reply_to_id)
+    || isOwnTranslation(root, env) || !positiveId(root.pull_request_review_id)) return;
+  const reviewJob = { ...job, kind: 'review', sourceId: root.pull_request_review_id };
+  const state = await syncNativeReview(token, reviewJob, env, options);
+  if (source.id === rootId || !state) return;
+  const translatedRoot = state.comments.get(rootId);
+  if (!translatedRoot || !positiveId(translatedRoot.id)) throw new GitHubFailure('Translated review thread is not available', true);
+  const marker = nativeReplyMarker(source.id);
+  const hash = await sourceHash(source);
+  const existing = await findBotReviewComment(token, owner, repo, number, marker, translatedRoot.id);
+  if (existing && hasHash(existing.body, hash)) return;
+  const translated = await translate(env, '', text(source.body).slice(0, MAX_CONTENT_CHARS), options);
+  const current = await getIfPresent(token, `${base}/pulls/comments/${source.id}`);
+  const currentRoot = await getIfPresent(token, `${base}/pulls/comments/${rootId}`);
+  if (!current || !eligibleSource(current, job, env) || !sourceMatches(currentRoot, { ...job, sourceId: rootId })
+    || isOwnTranslation(currentRoot, env)) return;
+  if (await sourceHash(current) !== hash || await sourceHash(currentRoot) !== await sourceHash(root)
+    || currentRoot.pull_request_review_id !== root.pull_request_review_id || positiveId(currentRoot.in_reply_to_id)
+    || current.in_reply_to_id !== rootId) throw new GitHubFailure('Original review reply changed during translation; retrying current text', true);
+  if (!repositoryEligible(await github(token, base), env)
+    || !containerEligible(await getIfPresent(token, `${base}/pulls/${number}`), job, env)) return;
+  const rendered = renderTranslation(job, translated, text(current.body).length > MAX_CONTENT_CHARS, current).body;
+  const body = addHash(rendered.replace(`<!-- pr-translator-bot:review-comment:v1:${source.id} -->`, marker), hash);
+  if (existing) await github(token, `${base}/pulls/comments/${existing.id}`, 'PATCH', { body });
+  else await github(token, `${base}/pulls/${number}/comments/${translatedRoot.id}/replies`, 'POST', { body });
+  console.info('Native review reply translation saved');
 }

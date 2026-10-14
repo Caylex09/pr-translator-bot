@@ -84,7 +84,7 @@ export default {
       if (event === 'pull_request') type = { version: 1 };
       else if (isComment && payload.issue?.pull_request) type = { version: 2, kind: 'issue_comment', commentId: source.id };
       else if (isIssue) type = { version: 3, kind: 'issue' };
-      else type = { version: 3, kind: isReview ? 'review' : isReviewComment ? 'review_comment' : 'issue_comment', sourceId: source.id };
+      else type = { version: isReview || isReviewComment ? 4 : 3, kind: isReview ? 'review' : isReviewComment ? 'review_comment' : 'issue_comment', sourceId: source.id };
       job = validateJob({
         ...type,
         installationId: payload.installation.id,
@@ -165,7 +165,8 @@ export default {
 
 function validateJob(value) {
   const isComment = value?.version === 2 && value?.kind === 'issue_comment';
-  const isContent = value?.version === 3 && ['issue', 'issue_comment', 'review', 'review_comment'].includes(value?.kind);
+  const isNativeReview = value?.version === 4 && ['review', 'review_comment'].includes(value?.kind);
+  const isContent = isNativeReview || (value?.version === 3 && ['issue', 'issue_comment', 'review', 'review_comment'].includes(value?.kind));
   const hasSource = isContent && value.kind !== 'issue';
   const fields = isContent ? ['version', 'kind', 'installationId', 'owner', 'repo', 'number', ...(hasSource ? ['sourceId'] : [])] : isComment
     ? ['version', 'kind', 'installationId', 'owner', 'repo', 'number', 'commentId']
@@ -183,7 +184,7 @@ function validateJob(value) {
     || value.repo === '.' || value.repo === '..') {
     throw new Error('Invalid PR translation job');
   }
-  return { version: isContent ? 3 : isComment ? 2 : 1,
+  return { version: isNativeReview ? 4 : isContent ? 3 : isComment ? 2 : 1,
     ...(isContent ? { kind: value.kind, ...(hasSource ? { sourceId: value.sourceId } : {}) } : isComment ? { kind: 'issue_comment', commentId: value.commentId } : {}),
     installationId: value.installationId,
     owner: value.owner, repo: value.repo, number: value.number };
@@ -202,7 +203,7 @@ function isOwnAppComment(comment, env) {
 }
 
 async function processJob(job, env, options = {}) {
-  if (job.version === 3) return processContentJob(job, env, options);
+  if (job.version === 3 || job.version === 4) return processContentJob(job, env, options);
   if (job.kind === 'issue_comment') return processComment(job, env, options);
   return processPullRequest(job, env, options);
 }

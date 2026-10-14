@@ -106,7 +106,7 @@ export async function getInstallationToken(env, installationId, { requirePullReq
       ? result.permissions.pull_requests : 'none';
     console.info(`GitHub installation permissions: issues=${issues}, pull_requests=${pullRequests}`);
     if (requirePullRequestsWrite && pullRequests !== 'write') {
-      throw new GitHubFailure('GitHub App installation requires Pull requests write permission to reply in review threads; approve updated installation permissions', false);
+      throw new GitHubFailure('GitHub App installation requires Pull requests write permission to publish translation Reviews and review comments; approve updated installation permissions', false);
     }
     if (issues !== 'write' && pullRequests !== 'write') {
       throw new GitHubFailure('GitHub App installation requires Issues or Pull requests write permission; approve updated installation permissions', false);

@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-自动将 GitHub PR 与 Issue 的标题、正文、讨论评论，以及 PR 行内审查评论和 Review 正文在中文与英文之间互译。新的行内译文直接回复到原代码审查线程，其他译文作为独立评论发布到对应 PR 或 Issue 的讨论区。
+自动将 GitHub PR 与 Issue 的标题、正文、讨论评论，以及 PR 行内审查评论和 Review 正文在中文与英文之间互译。PR Review 会生成翻译机器人自己的 Review，将译文正文与行内评论归在一起；PR／Issue 的标题、正文及普通评论则各自生成讨论区译文。
 
 机器人以 **GitHub App** 的形式运行在 **Cloudflare Workers** 上，通过 Cloudflare Queues 处理后台任务与有限次数的重试。支持 Gemini、OpenAI 兼容接口、OpenAI Responses 和 Anthropic。可按优先级配置多个站点与模型；某个接口失败或配额耗尽时，自动尝试下一项。安装一次 App，即可覆盖你选择的仓库，无需为每个仓库配置 GitHub Actions 工作流。
 
@@ -56,21 +56,21 @@ npm ci
 
 5. **安装 App。** 打开 App 的 **Install App**，选择 `TARGET_OWNER` 所属的目标仓库。创建一个含中文或英文内容的 PR 或 Issue，检查是否收到独立译文评论；其他内容类型的验证见[部署第 7 步](#7-验证翻译)。
 
-配置完成后，正常使用 GitHub 即可。创建或编辑**打开的 PR／Issue**会翻译标题和正文；新建或编辑讨论评论会创建或更新该来源的译文。Review 正文在 PR 的 **Conversation** 中有独立译文，新的行内译文则回复到原审查线程。每份译文都链接到自己的原文。旧版本已经发布到 Conversation 的行内译文仍在原处更新。已有历史不会自动补翻，需要编辑旧原文以触发它自己的翻译。
+配置完成后，正常使用 GitHub 即可。创建或编辑**打开的 PR／Issue**会翻译标题和正文；新建或编辑讨论评论会创建或更新该来源的译文。提交 Review 后，机器人创建自己的 Review，将原 Review 正文及行内评论的译文归在一起。原行内评论的后续回复会翻译到机器人对应的线程中。每份译文都链接到原文，编辑来源时更新对应译文。已有历史不会自动补翻，升级行为见[评论与 Review](#评论与-review)。
 
 部署后的机器人在 Cloudflare 上运行，无需一直开着本地终端。`npm run tail` 仅用于查看日志，按 `Ctrl+C` 会停止日志查看。修改源码或 `wrangler.toml` 后，运行 `npm run deploy` 应用更新；发布 GitHub Release 不会部署你的 Worker。
 
 ## 功能与行为
 
 - 翻译 **PR 与 Issue 的标题和正文**，保留原始文本。
-- 翻译新建或编辑的**讨论评论**、**PR 行内审查评论**，以及**已提交或编辑的 Review 正文**，包括其他机器人发布的内容。每个来源都有独立的译文评论，并附原文链接；编辑原文时更新对应译文。
+- 翻译新建或编辑的**讨论评论**、**PR 行内审查评论**，以及**已提交或编辑的 Review**，包括其他机器人发布的内容。每份原 Review 的正文及行内根评论一起翻译到机器人自己的 Review；普通讨论评论各自生成独立译文。原文链接用于核对来源，编辑原文时更新对应译文。
 - 由翻译模型判断主要语言：以中文为主时翻译成英文，其他情况翻译成简体中文。
 - 支持多个 API 站点、模型和 API Key，在每次翻译中按配置顺序自动切换。结果检查会拒绝明显未翻译的输出，随后尝试下一项服务。
 - 处理 `pull_request` 事件的 `opened`、`edited`、`reopened`、`ready_for_review` 动作。草稿 PR 也会处理；仅推送提交（`synchronize`）不会触发翻译。
-- 处理 `issues` 的 `opened`、`edited`、`reopened`；`issue_comment` 与 `pull_request_review_comment` 的 `created`、`edited`；以及 `pull_request_review` 的 `submitted`、`edited`。空白或尚未提交的 Review 正文会被跳过。
+- 处理 `issues` 的 `opened`、`edited`、`reopened`；`issue_comment` 与 `pull_request_review_comment` 的 `created`、`edited`；以及 `pull_request_review` 的 `submitted`、`edited`。Review 正文为空但包含行内评论时仍会翻译；尚未提交或没有受支持文本的 Review 会被跳过。
 - 翻译前从 GitHub 获取 PR／Issue 与对应来源的当前内容，仅处理打开的 PR 和 Issue。通过本机器人的作者身份与译文标记防止循环，即使译文被人工编辑过。
 - 先将任务保存到队列，临时失败时延迟重试；调用翻译 API 前检查安装的实际评论写权限。
-- 每个 PR／Issue 的标题与正文使用一个带标记的译文评论，每条原评论或 Review 则使用各自独立的译文评论；仅在生成内容发生变化时更新。并发事件仍可能产生重复评论，详见[限制说明](#安全与限制)。
+- 每个 PR／Issue 的标题与正文、每条讨论评论，都使用各自带标记的译文。Review 译文使用带标记的机器人 Review 及行内评论；这类任务会对比来源指纹，原文未变化时跳过翻译与写入。并发事件仍可能产生重复内容，详见[限制说明](#安全与限制)。
 - 只处理配置的仓库所有者，默认跳过私有仓库。
 
 例如，标题为“修复 Markdown 分页问题”的 PR，可能收到如下评论：
@@ -87,11 +87,13 @@ npm ci
 
 ### 评论与 Review
 
-启用对应 Webhook 事件后，在打开的 PR／Issue 上新建或编辑讨论评论、行内审查评论，或提交、编辑 Review 正文，会触发翻译。其他 GitHub App 发布的内容也会处理。编辑原文时更新其自己的译文，不会覆盖其他来源的译文。
+启用对应 Webhook 事件后，在打开的 PR／Issue 上新建或编辑讨论评论、行内审查评论，或提交、编辑 Review，会触发翻译。其他 GitHub App 发布的内容也会处理。编辑来源时更新其对应译文，不会覆盖其他来源的译文。
 
-讨论评论和 Review 正文的译文发布到 PR／Issue 讨论区。Review 译文注明原作者、对应 Review 的链接及其审查的提交。新的行内译文直接回复到原代码审查线程，注明原作者、文件、原审查位置和提交，并直接链接到原评论；对线程回复的翻译也留在该回复所属的根线程中。译文正文遵循原文的 Markdown 结构，原文及审查状态保持不变。位置描述的是原评论的审查上下文，推送新提交后可能已过时。
+普通讨论评论的译文发布到 PR／Issue 讨论区。每份已提交的原 Review 会生成机器人自己的 **COMMENT Review**，其中包含译文正文和行内根评论。行内建议归在翻译机器人的 Review 下，保留原文件及审查位置。译文注明原作者、原 Review 链接及审查的提交，每条行内译文也附原评论链接。译文遵循原文的 Markdown 结构。这份 Review 只提供翻译，不会批准 PR 或请求修改。
 
-旧版本已经发布到 Conversation 的行内译文仍在原位置更新。机器人不会搬移或删除已有译文，也不会自动迁移旧评论或补翻历史。运行 `npm run deploy` 部署当前代码后，尚无译文的行内来源才会采用线程回复方式。
+编辑原 Review 正文或行内评论时，更新对应的机器人 Review 或评论。原行内评论收到回复后，该回复的译文发布到机器人对应的线程中。GitHub 不允许向已提交的 Review 追加新的根评论，因此后来新增的根评论可能生成一份补充的机器人 Review。机器人保留原坐标及提交；无法安全表示时会使任务失败，不会把译文挂到另一段代码。推送新提交后，较早的审查位置可能已经过时。普通讨论评论中的审查汇总仍按普通评论翻译。
+
+运行 `npm run deploy` 部署当前代码后，新 Review 事件会采用这种方式。旧版本在 Conversation 或原作者审查线程中生成的译文不会搬移或删除。重投受支持的原 Review 事件，或编辑其来源，可能创建新的机器人 Review，同时保留旧译文。升级前已入队的旧版任务仍按旧方式输出，不会自动迁移或补翻历史。
 
 已有历史不会自动补翻。需要翻译旧内容时，在启用事件后编辑该原文，或重新投递对应来源的受支持事件。`pull_request`／`issues` 事件翻译标题与正文；讨论评论需要 `issue_comment`，行内评论需要 `pull_request_review_comment`，Review 正文需要 `pull_request_review`。
 
@@ -182,7 +184,7 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 
 **Issue comment** 同时负责 PR 和 Issue 的普通讨论评论；**Pull request review comment** 负责 PR 行内审查评论，不能代替前者。
 
-**Issues → Read and write** 用于读取 Issue，以及通过 [Issue Comments API](https://docs.github.com/en/rest/issues/comments) 创建和更新普通讨论评论；**Pull requests → Read and write** 用于访问 PR、Review 与行内评论，并通过 [Review Comments API](https://docs.github.com/en/rest/pulls/comments) 创建及更新行内译文。这项配置也符合[各类 Webhook 的权限要求](https://docs.github.com/en/webhooks/webhook-events-and-payloads)。完整的 PR 与 Issue 支持需要这两项权限。
+**Issues → Read and write** 用于读取 Issue，以及通过 [Issue Comments API](https://docs.github.com/en/rest/issues/comments) 创建和更新普通讨论评论；**Pull requests → Read and write** 用于访问 PR、Review 与行内评论，通过 [Reviews API](https://docs.github.com/en/rest/pulls/reviews) 发布及更新机器人 Review，并通过 [Review Comments API](https://docs.github.com/en/rest/pulls/comments) 创建及更新行内译文。这项配置也符合[各类 Webhook 的权限要求](https://docs.github.com/en/webhooks/webhook-events-and-payloads)。完整的 PR 与 Issue 支持需要这两项权限。
 
 升级已有 App 时，部署本版本，再进入 **Permissions & events → Subscribe to events**，勾选全部五项事件并保存，保留已经勾选的项目。如果原先 **Pull requests** 为只读，将其改为 **Read and write**，并由安装账号批准权限更新。已有安装同时具有两项写权限时，无需增加权限。现有 Worker Secrets 可以继续使用。
 
@@ -252,7 +254,7 @@ npx wrangler secret put GEMINI_API_KEY
 4. 再创建一个以英文为主的 PR，检查是否收到简体中文译文。
 5. 在打开的 PR 中新建一条英文 Conversation 评论，可包含 Markdown 链接或 HTML 标签，检查是否出现附原评论链接的独立中文译文。编辑原评论，确认对应的已有译文被更新。
 6. 创建 Issue，编辑标题或正文，再新建或编辑讨论评论。确认 Issue 的标题／正文与每条评论都有各自独立的译文。
-7. 提交一份正文非空的 PR Review，确认其独立 Conversation 译文注明作者、Review 链接及审查的提交。新建一条行内审查评论，检查同一代码审查线程内是否出现译文回复，并附原文链接、作者、文件、位置及提交。在该线程中回复，检查回复的译文也留在原线程。编辑各自的原文，检查对应已有译文是否更新；旧版本在 Conversation 中的行内译文仍在原处更新。正文为空的批准 Review 没有需要翻译的文本。
+7. 提交一份包含正文及一条或多条行内评论的 PR Review。确认翻译机器人创建自己的 **COMMENT Review**，把译文正文和行内建议归在一起，并保留原文件位置与审查的提交。检查原文链接及 Markdown 格式。在原行内评论下回复，确认回复的译文出现在机器人对应的线程中。编辑原 Review 正文及行内评论，确认已有译文更新；重投未变化的事件，确认没有额外创建 Review。正文为空但有行内评论的 Review 仍会翻译，没有受支持文本时会跳过。旧版译文仍保留在原位置。
 
 在 GitHub App 设置 → **Advanced → Recent Deliveries** 中查看 Webhook 响应。**`202 accepted` 表示任务已保存到队列，不代表翻译成功。** 在 `npm run tail` 中，队列处理会显示为独立的一次执行。修复永久性的配置或权限问题后，可以对相关事件点击 **Redeliver**，或编辑需要翻译的原文。`npm run tail` 只负责查看日志；按 `Ctrl+C` 停止它不会停止线上机器人。
 
@@ -342,9 +344,9 @@ Wrangler 提示时再粘贴 API Key，不要将其写进命令或配置文件。
 
 ### 队列处理与重试
 
-Webhook 等待队列写入成功后才返回 `202 accepted`。写入失败时返回 `503`，表示没有接受该任务，可以重新投递。任务只保存精简的仓库、安装与来源标识，不包含原文、API Key 或安装令牌。升级后仍支持版本 1 的 PR 标题／正文任务，以及版本 2 的 PR 讨论评论任务；扩展范围使用版本 3 任务，包含来源类型及需要时的来源 ID。
+Webhook 等待队列写入成功后才返回 `202 accepted`。写入失败时返回 `503`，表示没有接受该任务，可以重新投递。任务只保存精简的仓库、安装与来源标识，不包含原文、API Key 或安装令牌。升级后仍兼容旧版队列中版本 1–3 的任务。新的 Review 和行内审查评论事件使用版本 4，将译文归到机器人自己的 Review；Issue 任务继续使用版本 3。
 
-消费者获取新的安装令牌，检查已批准的评论写权限，再读取 PR／Issue 当前状态。评论与 Review 任务还会按 ID 读取来源并核验归属。非目标所有者的任务、已关闭的 PR／Issue，以及默认设置下已变为私有的仓库都会跳过；缺失、空白、由本机器人生成的来源及未提交的 Review 也会跳过。推荐的 **Issues → Read and write** 与 **Pull requests → Read and write** 配置覆盖完整范围，行内线程回复需要 Pull requests 写权限。权限诊断日志只输出权限名称与等级，不输出令牌。
+消费者获取新的安装令牌，检查已批准的写权限，再读取 PR／Issue 当前状态。评论与 Review 任务还会按 ID 读取来源并核验归属。非目标所有者的任务、已关闭的 PR／Issue，以及默认设置下已变为私有的仓库都会跳过；缺失、空白、由本机器人生成的来源及未提交的 Review 也会跳过。已提交的 Review 正文为空，但包含受支持的行内评论时仍会处理。推荐的 **Issues → Read and write** 与 **Pull requests → Read and write** 配置覆盖完整范围，机器人自己的 Review 及其行内线程需要 Pull requests 写权限。权限诊断日志只输出权限名称与等级，不输出令牌。
 
 `429`、`5xx`、网络错误、超时，以及未翻译而被拒绝的结果，会分别在 **30、60、120 秒**后重试，最多执行 **四次**。结果被拒绝时会先尝试剩余服务。每次执行有独立的翻译预算。配置无效、Secret 缺失、`401`／`403` 等认证或权限错误，以及重试次数耗尽的任务，会写入 `pr-translator-dead-letter`，写入成功后才确认原任务。死信写入失败时，保留原任务供重试。
 
@@ -362,7 +364,7 @@ Webhook 等待队列写入成功后才返回 `202 accepted`。写入失败时返
 npm test
 ```
 
-测试覆盖 Webhook 签名、JWT 签名、队列持久保存与确认、有限重试与死信处理、安装权限，以及 PR／Issue 的标题与正文翻译。评论与 Review 检查覆盖讨论评论、行内线程回复及更新、旧版 Conversation 译文、Review 正文与来源上下文、其他机器人作者、防止循环、来源缺失或变化及归属校验；还覆盖私有仓库过滤、服务配置、各类接口的请求／响应格式、照抄原文或语言不符的结果校验及自动切换行为。测试使用模拟 API 响应，不需要真实凭据。`npm run test:runtime` 单独运行 Miniflare/workerd 检查，使用真正的 Worker 运行时并拦截出站请求；这些检查也包含在 `npm test` 中。实际部署与翻译质量需按上面的手动步骤验证。
+测试覆盖 Webhook 签名、JWT 签名、队列持久保存与确认、有限重试与死信处理、安装权限，以及 PR／Issue 的标题与正文翻译。评论与 Review 检查覆盖讨论评论、机器人自己的 Review 及行内评论分组、原文与译文对应关系、编辑与回复、来源未变化时去重、旧版输出、其他机器人作者、防止循环、来源缺失或变化及归属校验；还覆盖私有仓库过滤、服务配置、各类接口的请求／响应格式、批量结果条目校验、照抄原文或语言不符的结果校验及自动切换行为。测试使用模拟 API 响应，不需要真实凭据。`npm run test:runtime` 单独运行 Miniflare/workerd 检查，使用真正的 Worker 运行时并拦截出站请求；这些检查也包含在 `npm test` 中。实际部署与翻译质量需按上面的手动步骤验证。
 
 在本地处理 Webhook 时，将 [.dev.vars.example](.dev.vars.example) 复制为 `.dev.vars`，填写 GitHub 凭据，并启用服务列表需要的 API Key 变量。默认单 Gemini 配置需要 `GEMINI_API_KEY`。不要公开 `.dev.vars`；`.gitignore` 会忽略该文件，同时允许提交示例模板。
 
@@ -388,7 +390,7 @@ npm run dev
 
 ## 费用与翻译服务
 
-托管限制与翻译配额独立计算。每次翻译尝试都可能由 API 服务商计费，包括最终结果无法使用的尝试。每个符合条件的标题／正文事件、评论新建或编辑、Review 提交或编辑都会产生独立任务。启用更多事件会增加调用；自动切换与重试可能让同一个来源产生多次调用。部署前请确认各服务的当前价格和账号实际配额。
+托管限制与翻译配额独立计算。每次翻译尝试都可能由 API 服务商计费，包括最终结果无法使用的尝试。符合条件的标题／正文事件、评论新建或编辑、Review 提交或编辑都会产生队列任务。每份原 Review 的正文及行内根评论会批量翻译；来源未变化且已有对应译文时，Review 任务跳过模型调用。启用更多事件可能增加调用，自动切换与重试可能让同一个来源产生多次调用。部署前请确认各服务的当前价格和账号实际配额。
 
 - **Gemini：已集成。** 当前配置模型为 `gemini-3.5-flash-lite`。免费访问与速率限制取决于模型、地区和账号，详见 [Gemini 价格](https://ai.google.dev/gemini-api/docs/pricing)及[速率限制](https://ai.google.dev/gemini-api/docs/rate-limits)。
 - **OpenAI 兼容 Chat Completions、OpenAI Responses 和 Anthropic Messages：已集成。** 使用对应站点的模型 ID 和 API Key；详见 [OpenAI 价格](https://developers.openai.com/api/docs/pricing)和 [Anthropic 价格](https://platform.claude.com/docs/en/about-claude/pricing)。第三方站点自行规定价格和配额。
@@ -406,14 +408,16 @@ npm run dev
 - **`200 ignored owner`**：仓库所有者名称与 `TARGET_OWNER` 不匹配。
 - **`200 ignored private repository`**：私有仓库处理未开启。确认准备翻译其内容后，才将 `ALLOW_PRIVATE` 设为 `"true"` 并重新部署。
 - **`200 ignored action` / `200 ignored`**：动作或事件不在支持范围内。签名有效的 `ping` 会返回 `200 pong`。
-- **标题可以翻译，评论或 Review 没有翻译**：部署当前代码，在 **Permissions & events → Subscribe to events** 中勾选全部五项事件。讨论评论使用 `issue_comment`（`created`／`edited`），行内评论使用 `pull_request_review_comment`（`created`／`edited`），Review 正文使用 `pull_request_review`（`submitted`／`edited`）。在 Recent Deliveries 中检查 `X-GitHub-Event` 与动作。编辑标题或正文不会翻译已有评论；需要在打开的 PR／Issue 上触发或重投该来源自己的事件。空白或未提交的 Review 会被跳过。新的行内译文在原代码审查线程中，Review 正文译文在 Conversation 中，旧版行内译文仍留在 Conversation。
-- **译文似乎与当前代码差异对应不上**：通过译文的原文链接、作者、文件／位置和审查的提交，核对它翻译的是哪一条评论或哪一次 Review。较早的审查可能针对旧提交。新的行内译文留在原线程，旧版译文不会自动搬移。仅推送提交不会刷新 Review 译文。
+- **标题可以翻译，评论或 Review 没有翻译**：部署当前代码，在 **Permissions & events → Subscribe to events** 中勾选全部五项事件。讨论评论使用 `issue_comment`（`created`／`edited`），行内评论使用 `pull_request_review_comment`（`created`／`edited`），Review 使用 `pull_request_review`（`submitted`／`edited`）。在 Recent Deliveries 中检查 `X-GitHub-Event` 与动作。编辑标题或正文不会翻译已有评论；需要在打开的 PR／Issue 上触发或重投该来源自己的事件。未提交或没有受支持文本的 Review 会被跳过。译文正文及行内根评论归在翻译机器人自己的 Review 下，后续回复的译文在该 Review 对应的线程中。旧版译文仍保留在原位置。
+- **译文似乎与当前代码差异对应不上**：通过译文的原文链接、作者、文件／位置和审查的提交，核对它翻译的是哪一条评论或哪一次 Review。较早的审查可能针对旧提交。新的行内根译文归在机器人自己的 Review 下，并保留原位置；旧版译文不会自动搬移。仅推送提交不会刷新 Review 译文。
+- **旧译文仍在原审查作者的线程下**：这些内容由旧版本生成。当前版本会对新事件创建自己的 Review，不会删除之前的评论。要让旧 Review 采用新布局，可以重投其受支持事件或编辑来源。初次机器人 Review 已提交后再收到新的行内根评论，可能出现补充 Review。
+- **Review 任务因位置或查找上限失败**：检查队列日志及原 Review。机器人保留原审查提交及行内坐标，不支持的坐标、提交不匹配或超出查找与批量上限都会终止任务。队列模式会将永久失败写入死信队列，不会为了让请求成功而将评论搬到较新的代码上。
 - **`400 Invalid JSON` 或缺少字段的响应**：签名有效，但载荷格式错误或缺少必要的安装、仓库、PR／Issue、评论或 Review 字段；检查事件载荷，尤其是手动构造的测试请求。
 - **`202 accepted`，但没有评论**：在 `npm run tail` 中查看队列执行日志。临时失败会显示延迟重试；永久失败或次数耗尽会进入死信队列。已关闭的 PR／Issue 会被跳过。检查 GitHub Secrets、App 安装与权限、服务配置、模型访问、配额和 API Key Secret 名称。
 - **入队时 Webhook 返回 `503`**：确认 `pr-translator-jobs` 已创建、生产者绑定已部署，以及账号的 Queues 操作限额未耗尽。修复后重新投递 GitHub 事件。
 - **`GITHUB_PRIVATE_KEY must be PKCS#8`**：转换私钥，上传完整的 `BEGIN PRIVATE KEY` PEM 内容，不要上传文件名。
 - **日志中出现 GitHub API `401` / `403`**：检查 App ID、私钥、安装范围和已批准的仓库权限。
-- **评论写权限缺失，或 GitHub 请求返回 `403`**：查看 `GitHub installation permissions:` 日志。完整范围需要将 **Issues** 和 **Pull requests** 都设为 **Read and write**，其中行内线程回复需要 Pull requests 写权限。保存 App 权限修改后，由安装账号批准更新。确认修改的是 `GITHUB_APP_ID` 对应的 App，且安装范围包含目标仓库，再重新投递支持的来源事件。机器人会在调用翻译模型前检查已批准的评论写权限并读取原文；切换翻译服务或重新部署 Worker 都不会授予缺失的 GitHub 权限。
+- **评论写权限缺失，或 GitHub 请求返回 `403`**：查看 `GitHub installation permissions:` 日志。完整范围需要将 **Issues** 和 **Pull requests** 都设为 **Read and write**，其中机器人自己的 Review 及其行内线程需要 Pull requests 写权限。保存 App 权限修改后，由安装账号批准更新。确认修改的是 `GITHUB_APP_ID` 对应的 App，且安装范围包含目标仓库，再重新投递支持的来源事件。机器人会在调用翻译模型前检查已批准的写权限并读取原文；切换翻译服务或重新部署 Worker 都不会授予缺失的 GitHub 权限。
 - **服务返回 `404`**：检查模型 ID 和 `base_url`。填写 API 前缀，不是完整接口路径；OpenAI 兼容 Chat Completions 站点应使用 `type: "openai"`。
 - **服务返回 `402` / `429`**：检查配额、计费与速率限制。剩余时间允许时，机器人会尝试下一项。队列模式下，全部服务失败且含 `429` 临时失败时可以延迟重试；单独的 `402` 视为永久性的计费问题。
 - **返回格式无效或 JSON 模式报错**：检查站点响应格式是否与所选 `type` 匹配。不支持 JSON-object 模式的 OpenAI 兼容站点，可将 `json_mode` 设为 `false`；译文仍必须是包含所需字段的有效 JSON。
@@ -425,11 +429,11 @@ npm run dev
 
 - **凭据安全：** 使用原始请求体进行 HMAC-SHA256 签名验证。GitHub 请求通过 RS256 App JWT 获取短期安装令牌，无需个人访问令牌。不要提交 API Key 或私钥；`.gitignore` 已排除 `.dev.vars*`、`.env*`、`*.pem` 和 `*.key`。
 - **私有内容：** PR／Issue 的标题与正文、讨论评论、行内审查评论及 Review 正文可能发送给列表中实际尝试到的任一服务，包括第三方 API 站点。默认禁用私有仓库处理；启用前应确认列表中的所有服务都可信，并检查其数据使用条款。使用 Gemini 时，也请查看 [Gemini 数据使用条款](https://ai.google.dev/gemini-api/terms)。
-- **翻译保真：** 提示词要求模型保留原文的 Markdown 结构、链接、代码、HTML 标签与属性、时间戳、标识符、路径、URL、Issue 编号和提及。JSON 输出会被解析并检查所需字段；额外检查会拒绝明显照抄自然语言正文，或足够长的英文来源缺少中文译文的结果。这些检查仍信任模型声明的原文语言，无法证明语义准确或格式被完整保留。短文本及混合语言处理仍依赖模型输出。
+- **翻译保真：** 提示词要求模型保留原文的 Markdown 结构、链接、代码、HTML 标签与属性、时间戳、标识符、路径、URL、Issue 编号和提及。JSON 输出会被解析并检查所需字段。Review 批量结果必须包含全部预期条目 ID，不能缺失、重复或混入未知 ID，以维持原文与译文的对应关系。额外检查会拒绝明显照抄自然语言正文，或足够长的英文来源缺少中文译文的结果。这些检查仍信任模型声明的原文语言，无法证明语义准确或格式被完整保留。短文本及混合语言处理仍依赖模型输出。
 - **文本长度：** 每条描述、原评论或 Review 正文只翻译前 **12,000 个 UTF-16 代码单元**。超出时，译文中会附带截断提示。
-- **评论查找：** 最多检查前 **500 条讨论评论**及 **500 条审查评论**，寻找带有译文标记的机器人评论。PR 标题／正文译文保留 `<!-- pr-translator-bot:v1 -->`，其他每个来源使用各自独立的标记。找不到讨论译文时会新建评论；若五页审查评论均已满且找不到对应行内译文，则以 `Review translation lookup exceeds 500 comments` 终止，避免重复回复，队列模式会将该任务写入死信队列。
-- **范围与删除：** 来源必须属于打开的 PR／Issue。Review 正文的译文发布到 Conversation，新的行内译文回复到原审查线程。旧版在 Conversation 中的行内译文仍在原处更新，不会自动迁移或删除。本机器人生成的内容会被跳过，防止循环；其他机器人发布的评论仍会处理。删除原文不会删除已经发布的译文，已有历史不会自动补翻。代码差异、提交评论和 GitHub Discussions 不会翻译。
-- **投递与并发：** Queues 至少投递一次。默认消费者的批大小与最大并发数均为一，可降低评论竞争，但没有持久锁或全局幂等状态，重复投递与并发部署仍可能创建重复评论。每次符合条件的执行仍会请求翻译，即使最终生成的评论没有变化。详见[投递保证](https://developers.cloudflare.com/queues/reference/delivery-guarantees/)。
+- **查找与批量上限：** 讨论译文最多检查 **500 条讨论评论**；机器人 Review 的匹配最多检查 **500 份 Review**及**每份 Review 的 500 条评论**，旧版行内查找也有上限。每份原 Review 的翻译批次最多包含 **100 条行内根评论**。复制原生行内评论需要原始行坐标；没有这些坐标的文件级评论目前不受支持，会终止该 Review 任务。查找超限或批次不受支持时会终止任务，避免错配或重复输出；队列模式会将永久失败写入死信队列。译文标记用于关联准确的原文来源。
+- **范围与删除：** 来源必须属于打开的 PR／Issue。新的 Review 译文是机器人自己的 COMMENT Review，行内评论归在该 Review 下，回复的译文也放在对应的机器人线程中。原审查提交及坐标必须仍可使用；已提交后新增的根评论可能需要补充 Review。旧版 Conversation 或原线程译文保留在原处，已经入队的旧版任务仍按旧方式处理。重投事件可能为旧来源创建新的机器人 Review，不会自动迁移、删除或补翻历史。本机器人生成的内容会被跳过，防止循环；其他机器人发布的评论仍会处理。删除原文不会删除已经发布的译文。代码差异、提交评论和 GitHub Discussions 不会翻译。
+- **投递与并发：** Queues 至少投递一次。默认消费者的批大小与最大并发数均为一，可降低竞争。Review 任务会对比来源指纹及带标记的译文，原文未变时跳过翻译与写入。机器人没有持久锁或全局幂等状态，并发部署或竞争仍可能创建重复输出；其他类型的任务在未变化的投递中仍可能再次调用模型。详见[投递保证](https://developers.cloudflare.com/queues/reference/delivery-guarantees/)。
 - **处理时限与重试：** 队列模式的翻译预算默认 60 秒，每次可设置为最多 120 秒，并支持有限次数的延迟重试。重试可能再次调用模型并产生额外费用。队列无法保证不可用的 API 恢复成功；待处理和死信消息会按账号的保留期限过期。HTTP 后台模式维持较短时限，不会自动重试。
 
 ## 发布到 GitHub
@@ -498,7 +502,8 @@ pr-translator-bot/
     ├── webhook.test.js       # 签名验证与 JWT 签名
     ├── integration.test.js   # 模拟评论流程与私有仓库过滤
     ├── comment.test.js       # PR Conversation 事件、归属校验与更新
-    ├── content.test.js       # Issue、讨论评论、行内评论与 Review
+    ├── content.test.js       # Issue、讨论评论、行内评论与旧版 Review
+    ├── native-review.test.js # bot 自己的 Review、来源对应、更新与回复
     ├── queue.test.js         # 持久保存、权限、重试与死信
     ├── runtime.test.js       # 真实 Worker 运行时与拦截的 API 请求
     ├── runtime-queue.test.js # 真实 Worker 运行时中的原生队列处理

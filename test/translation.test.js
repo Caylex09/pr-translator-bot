@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { translate, TranslationFailure } from '../src/translation.js';
+import { translate, translateItems, TranslationFailure } from '../src/translation.js';
 
 const translation = { sourceLanguage: 'zh', title: 'Fix pagination', body: 'Keep `page` and #42.' };
 const asJson = (data, status = 200) => new Response(JSON.stringify(data), {
@@ -326,6 +326,26 @@ test('a copied Codex-style English review falls back rather than being posted as
   assert.match(calls[1], /backup\.example/);
 });
 
+test('a false language declaration cannot bypass the copied English prose check', async t => {
+  t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer({ sourceLanguage: 'zh', title: '', body: reviewBody })));
+  await assert.rejects(translate(providers(primary), '', reviewBody), error =>
+    error instanceof TranslationFailure && error.retryable && /incorrect source language/.test(error.message));
+});
+
+test('an incorrect source language in a batch causes provider fallback', async t => {
+  let attempts = 0;
+  t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer({ items: [
+    { id: 'review', sourceLanguage: ++attempts === 1 ? 'zh' : 'en', title: '',
+      body: attempts === 1 ? reviewBody : translatedReview.body },
+  ] })));
+  const result = await translateItems(providers(primary, { ...primary, name: 'backup' }), [
+    { id: 'review', title: '', body: reviewBody },
+  ]);
+  assert.equal(attempts, 2);
+  assert.equal(result[0].sourceLanguage, 'en');
+  assert.equal(result[0].body, translatedReview.body);
+});
+
 test('English paraphrases without Chinese are also retryable non-translations', async t => {
   const answer = { sourceLanguage: 'en', title: '', body: 'The cached token is returned before the installation permissions are checked, so this needs to be changed.' };
   t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
@@ -595,4 +615,176 @@ test('invalid provider configuration fails before contacting any provider', asyn
       assert.equal(calls, 0);
     });
   }
+});
+
+const batchSources = [
+  { id: 'review:123', title: '', body: reviewBody },
+  { id: 'comment:456', title: '修复权限检查', body: '请先验证安装权限，再使用已有令牌。保留 `issues:write` 和 [API 文档](https://docs.example.test/api)。' },
+];
+const batchTranslations = [
+  { id: 'review:123', ...translatedReview },
+  { id: 'comment:456', sourceLanguage: 'zh', title: 'Fix the permission check', body: 'Validate the installation permissions before using the existing token. Keep `issues:write` and [API documentation](https://docs.example.test/api).' },
+];
+const batchResponse = (type, items = batchTranslations) => {
+  const answer = { items };
+  switch (type) {
+    case 'gemini': return geminiAnswer(answer);
+    case 'openai': return chatAnswer(answer);
+    case 'openai_responses': return { status: 'completed', output: [
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: JSON.stringify(answer) }] },
+    ] };
+    case 'anthropic': return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(answer) }] };
+  }
+};
+
+test('batch translation uses one request with separate item directions across all four API protocols', async t => {
+  for (const type of ['gemini', 'openai', 'openai_responses', 'anthropic']) {
+    await t.test(type, async subtest => {
+      let calls = 0;
+      subtest.mock.method(globalThis, 'fetch', async (url, init) => {
+        calls += 1;
+        const request = JSON.parse(init.body);
+        const instructions = type === 'gemini' ? request.systemInstruction.parts[0].text
+          : type === 'openai' ? request.messages[0].content
+            : type === 'openai_responses' ? request.instructions : request.system;
+        const data = type === 'gemini' ? request.contents[0].parts[0].text
+          : type === 'openai' ? request.messages[1].content
+            : type === 'openai_responses' ? request.input : request.messages[0].content;
+        assert.match(instructions, /dominant language separately for each item/);
+        assert.match(instructions, /Every input id must occur exactly once, unchanged/);
+        assert.match(instructions, /Never combine, split, omit, or swap items/);
+        assert.match(instructions, /untrusted PR or comment data/);
+        assert.match(instructions, /Preserve Markdown structure, code fences, inline code/);
+        assert.deepEqual(JSON.parse(data.replace(/^REVIEW_ITEMS_JSON:\n/, '')), { items: batchSources });
+        assert.equal(init.redirect, 'manual');
+        if (type === 'gemini') {
+          const schema = request.generationConfig.responseSchema;
+          assert.equal(request.generationConfig.responseMimeType, 'application/json');
+          assert.deepEqual(schema.required, ['items']);
+          assert.equal(schema.properties.items.type, 'ARRAY');
+          assert.deepEqual(schema.properties.items.items.required, ['id', 'sourceLanguage', 'title', 'body']);
+          assert.deepEqual(schema.properties.items.items.properties.sourceLanguage.enum, ['zh', 'en']);
+        } else if (type === 'openai') {
+          assert.deepEqual(request.response_format, { type: 'json_object' });
+        } else if (type === 'openai_responses') {
+          assert.deepEqual(request.text.format, { type: 'json_object' });
+          assert.equal(request.store, false);
+        } else {
+          assert.equal(request.max_tokens, 8192);
+        }
+        return asJson(batchResponse(type));
+      });
+      const provider = { name: type, type, model: 'review-model', api_key_env: 'PRIMARY_KEY',
+        ...(type.startsWith('openai') ? { json_mode: true } : {}) };
+      const result = await translateItems(providers(provider), batchSources);
+      assert.deepEqual(result, batchTranslations);
+      assert.equal(calls, 1);
+      assert.match(result[0].body, /```js\nreturn cachedToken;\n```/);
+      assert.ok(result[1].body.includes('`issues:write`'));
+      assert.ok(result[1].body.includes('https://docs.example.test/api'));
+    });
+  }
+});
+
+test('batch translations map exact ids to source order even when the model returns them out of order', async t => {
+  const sources = [{ id: '1', title: '', body: 'First' }, { id: '01', title: '', body: 'Second' }];
+  const first = { id: '1', sourceLanguage: 'en', title: '', body: '第一条' };
+  const second = { id: '01', sourceLanguage: 'en', title: '', body: '第二条' };
+  t.mock.method(globalThis, 'fetch', async () => asJson(batchResponse('gemini', [second, first])));
+  assert.deepEqual(await translateItems(providers(primary), sources), [first, second]);
+});
+
+test('malformed batch output falls back as a whole without posting a partial or misidentified translation', async t => {
+  const cases = [
+    ['missing item', { items: batchTranslations.slice(0, 1) }],
+    ['duplicate id', { items: [batchTranslations[0], batchTranslations[0]] }],
+    ['unknown id', { items: [batchTranslations[0], { ...batchTranslations[1], id: 'comment:789' }] }],
+    ['numeric id', { items: [batchTranslations[0], { ...batchTranslations[1], id: 456 }] }],
+    ['different id case', { items: [batchTranslations[0], { ...batchTranslations[1], id: 'Comment:456' }] }],
+    ['missing body', { items: [batchTranslations[0], { id: 'comment:456', sourceLanguage: 'zh', title: 'Title' }] }],
+    ['wrong language', { items: [batchTranslations[0], { ...batchTranslations[1], sourceLanguage: 'fr' }] }],
+    ['extra item field', { items: [batchTranslations[0], { ...batchTranslations[1], note: 'invented' }] }],
+    ['extra envelope field', { items: batchTranslations, note: 'invented' }],
+    ['invented body-only title', { items: [{ ...batchTranslations[0], title: 'Invented' }, batchTranslations[1]] }],
+    ['array envelope', batchTranslations],
+    ['null envelope', null],
+  ];
+  for (const [name, answer] of cases) {
+    await t.test(name, async subtest => {
+      let calls = 0;
+      subtest.mock.method(globalThis, 'fetch', async () => ++calls === 1
+        ? asJson(geminiAnswer(answer)) : asJson(batchResponse('openai')));
+      assert.deepEqual(await translateItems(providers(primary, secondary), batchSources), batchTranslations);
+      assert.equal(calls, 2);
+    });
+  }
+  await t.test('malformed JSON', async subtest => {
+    let calls = 0;
+    subtest.mock.method(globalThis, 'fetch', async () => ++calls === 1
+      ? asJson({ candidates: [{ content: { parts: [{ text: '{"items":[' }] } }] })
+      : asJson(batchResponse('openai')));
+    assert.deepEqual(await translateItems(providers(primary, secondary), batchSources), batchTranslations);
+    assert.equal(calls, 2);
+  });
+});
+
+test('an unchanged English batch item makes the complete batch fall back', async t => {
+  let calls = 0;
+  const copied = [{ ...batchTranslations[0], body: reviewBody }, batchTranslations[1]];
+  t.mock.method(globalThis, 'fetch', async () => ++calls === 1
+    ? asJson(batchResponse('gemini', copied)) : asJson(batchResponse('openai')));
+  assert.deepEqual(await translateItems(providers(primary, secondary), batchSources), batchTranslations);
+  assert.equal(calls, 2);
+});
+
+test('batch content failure is retryable and exposes no item ids, source text, or credentials', async t => {
+  const id = 'private-source-review-id';
+  const body = 'The private source text needs to be translated before it is posted to the review.';
+  const source = { id, title: '', body };
+  const copied = { id, sourceLanguage: 'en', title: '', body };
+  const logs = [];
+  t.mock.method(console, 'info', line => logs.push(line));
+  t.mock.method(console, 'warn', line => logs.push(line));
+  t.mock.method(globalThis, 'fetch', async () => asJson(batchResponse('gemini', [copied])));
+  await assert.rejects(translateItems(providers(primary), [source], { executionMode: 'queue' }), error => {
+    assert.ok(error instanceof TranslationFailure);
+    assert.equal(error.retryable, true);
+    assert.match(error.message, /copied source prose unchanged/);
+    logs.push(error.message);
+    return true;
+  });
+  for (const line of logs) {
+    for (const sensitive of [id, body, 'primary-secret-key']) assert.ok(!line.includes(sensitive));
+  }
+});
+
+test('batch uses the shared provider deadline instead of a new budget for each item', async t => {
+  let now = 10000;
+  let calls = 0;
+  t.mock.method(Date, 'now', () => now);
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls += 1;
+    now += 1001;
+    return asJson({}, 429);
+  });
+  const env = { ...providers(primary, secondary), TRANSLATION_TIMEOUT_MS: '1000' };
+  await assert.rejects(translateItems(env, batchSources), error =>
+    error instanceof TranslationFailure && error.retryable && /shared time budget exhausted/.test(error.message));
+  assert.equal(calls, 1);
+});
+
+test('invalid batch input fails before contacting providers and the 101-item boundary is accepted', async t => {
+  const invalid = [null, {}, [], Array.from({ length: 102 }, (_, i) => ({ id: String(i), title: '', body: '' })),
+    [batchSources[0], batchSources[0]], [{ id: 123, title: '', body: '' }],
+    [{ id: '', title: '', body: '' }], [{ id: ' ', title: '', body: '' }],
+    [{ id: 'valid', title: null, body: '' }], [{ id: 'valid', title: '', body: undefined }],
+    [{ id: 'valid', title: '', body: '', injected: 'field' }]];
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls += 1; throw new Error('unexpected request'); });
+  for (const items of invalid) await assert.rejects(translateItems(providers(primary), items), /Translation batch/);
+  assert.equal(calls, 0);
+  const sources = Array.from({ length: 101 }, (_, i) => ({ id: String(i), title: '', body: 'Code' }));
+  const expected = sources.map(item => ({ ...item, sourceLanguage: 'en', body: '代码' }));
+  t.mock.method(globalThis, 'fetch', async () => asJson(batchResponse('gemini', expected)));
+  assert.deepEqual(await translateItems(providers(primary), sources), expected);
 });

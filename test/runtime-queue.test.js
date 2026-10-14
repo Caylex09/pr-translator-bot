@@ -8,6 +8,10 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
   const bodyOnly = isComment || (contentKind && contentKind !== 'issue');
   const issueContainer = contentKind === 'issue' || contentKind === 'issue_comment';
   const sourceId = contentKind === 'review' ? 66 : contentKind === 'review_comment' ? 77 : 55;
+  const ownReview = contentKind === 'review' || contentKind === 'review_comment';
+  const reviewedCommit = '6eca397f2390e75a6309e4fa5a93f0c7e3f7c392';
+  const ownReviews = [];
+  const ownRoots = [];
   const { privateKey, publicKey } = generateKeyPairSync('rsa', {
     modulusLength: 2048,
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
@@ -46,7 +50,7 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
           assert.equal(JSON.parse(Buffer.from(parts[1], 'base64url')).iss, '456');
           assert.equal(verify('RSA-SHA256', Buffer.from(`${parts[0]}.${parts[1]}`),
             publicKey, Buffer.from(parts[2], 'base64url')), true);
-          return Response.json({ token, permissions: { issues: 'write', pull_requests: contentKind === 'review_comment' ? 'write' : 'read' } });
+          return Response.json({ token, permissions: { issues: 'write', pull_requests: ownReview ? 'write' : 'read' } });
         }
         assert.equal(request.headers.get('authorization'), `Bearer ${token}`);
         if (contentKind && url.pathname === '/repos/example-owner/demo') {
@@ -70,30 +74,64 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
             user: { login: 'another-review-service[bot]', type: 'Bot' },
             performed_via_github_app: { id: 999 } });
         }
-        if (contentKind === 'review' && url.pathname === '/repos/example-owner/demo/pulls/42/reviews/66') {
-          return Response.json({ id: 66, state: 'COMMENTED', body: originalComment,
+        if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews/66') {
+          return Response.json({ id: 66, state: 'COMMENTED', body: originalComment, commit_id: reviewedCommit,
             html_url: 'https://github.com/example-owner/demo/pull/42#pullrequestreview-66' });
         }
         if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/comments/77') {
           return Response.json({ id: 77, body: originalComment,
             ...(isInlineReply ? { in_reply_to_id: 88 } : {}),
+            pull_request_review_id: 66, original_commit_id: reviewedCommit,
+            original_line: 33, side: 'RIGHT', path: 'src/example.js',
             pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' });
         }
         if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/comments/88') {
           assert.equal(request.method, 'GET');
-          return Response.json({ id: 88, body: 'Thread root',
+          return Response.json({ id: 88, body: 'Thread root', pull_request_review_id: 66,
+            original_commit_id: reviewedCommit, original_line: 33, side: 'RIGHT', path: 'src/example.js',
             pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' });
         }
         if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/42/comments') {
           assert.equal(request.method, 'GET');
-          return Response.json([]);
+          return Response.json(ownRoots);
         }
-        if (contentKind === 'review_comment' && url.pathname === `/repos/example-owner/demo/pulls/42/comments/${isInlineReply ? 88 : 77}/replies`) {
+        if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews/66/comments') {
+          return Response.json(contentKind === 'review' ? [] : [{ id: isInlineReply ? 88 : 77,
+            body: isInlineReply ? 'Thread root' : originalComment, pull_request_review_id: 66,
+            original_commit_id: reviewedCommit, original_line: 33, side: 'RIGHT', path: 'src/example.js',
+            pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' }]);
+        }
+        if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews/600/comments') {
+          return Response.json(ownRoots);
+        }
+        if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews') {
+          if (request.method === 'GET') return Response.json(ownReviews);
+          assert.equal(request.method, 'POST');
+          const data = await request.json();
+          assert.equal(data.event, 'COMMENT');
+          assert.equal(data.commit_id, reviewedCommit);
+          assert.equal(data.comments.length, contentKind === 'review_comment' ? 1 : 0);
+          for (const [index, comment] of data.comments.entries()) {
+            assert.equal(comment.line, 33);
+            assert.equal(comment.side, 'RIGHT');
+            assert.equal(comment.path, 'src/example.js');
+            ownRoots.push({ ...comment, id: 700 + index, user: { type: 'Bot' }, pull_request_review_id: 600,
+              pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' });
+          }
+          ownReviews.push({ id: 600, body: data.body, user: { type: 'Bot' }, commit_id: data.commit_id,
+            html_url: 'https://github.com/example-owner/demo/pull/42#pullrequestreview-600' });
+          if (!isInlineReply) {
+            postedComment = contentKind === 'review_comment' ? ownRoots[0].body : data.body;
+            resolvePosted();
+          }
+          return Response.json(ownReviews[0]);
+        }
+        if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/42/comments/700/replies') {
           assert.equal(request.method, 'POST');
           postedComment = (await request.json()).body;
           resolvePosted();
           return Response.json({ id: 100, body: postedComment, user: { type: 'Bot' },
-            in_reply_to_id: isInlineReply ? 88 : 77 }, { status: 201 });
+            in_reply_to_id: 700 }, { status: 201 });
         }
         if (url.pathname === '/repos/example-owner/demo/issues/42/comments') {
           if (request.method === 'GET') return Response.json([]);
@@ -108,6 +146,12 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
         assert.equal(url.pathname, '/v1beta/models/runtime-model:generateContent');
         assert.equal(request.headers.get('x-goog-api-key'), apiKey);
         const data = await request.json();
+        if (ownReview && data.contents[0].parts[0].text.startsWith('REVIEW_ITEMS_JSON:')) {
+          const input = JSON.parse(data.contents[0].parts[0].text.split('\n').slice(1).join('\n'));
+          return Response.json({ candidates: [{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify({
+            items: input.items.map(item => ({ id: item.id, ...translation })),
+          }) }] } }] });
+        }
         const contents = JSON.stringify(data.contents);
         if (bodyOnly) {
           const input = JSON.parse(data.contents[0].parts[0].text.replace(/^PR_DATA_JSON:\n/, ''));
@@ -194,7 +238,9 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
     })]);
     if (contentKind) {
       const markerKind = contentKind.replace('_', '-');
-      const marker = contentKind === 'issue' ? '<!-- pr-translator-bot:issue:v1 -->'
+      const marker = ownReview ? isInlineReply ? `<!-- pr-translator-bot:review-reply:v1:${sourceId} -->`
+        : `<!-- pr-translator-bot:${markerKind}:v2:${sourceId} -->`
+        : contentKind === 'issue' ? '<!-- pr-translator-bot:issue:v1 -->'
         : `<!-- pr-translator-bot:${markerKind}:v1:${sourceId} -->`;
       assert.ok(postedComment.startsWith(marker));
       assert.match(postedComment, bodyOnly ? /审查汇总/ : /Fix pagination/);
@@ -214,7 +260,12 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
       assert.match(postedComment, /\*\*Fix pagination\*\*/);
       assert.match(postedComment, /Keep Markdown intact\./);
     }
-    if (contentKind) {
+    if (ownReview) {
+      assert.ok(calls.includes('POST api.github.com/repos/example-owner/demo/pulls/42/reviews'));
+      assert.equal(calls.some(value => /^POST .*\/comments\/(?:77|88)\/replies$/.test(value)), false);
+      assert.equal(calls.includes('POST api.github.com/repos/example-owner/demo/issues/42/comments'), false);
+      if (isInlineReply) assert.ok(calls.includes('POST api.github.com/repos/example-owner/demo/pulls/42/comments/700/replies'));
+    } else if (contentKind) {
       const repositoryPath = 'GET api.github.com/repos/example-owner/demo';
       const containerPath = `${repositoryPath}/${issueContainer ? 'issues' : 'pulls'}/42`;
       const sourcePath = contentKind === 'issue' ? containerPath : contentKind === 'issue_comment'

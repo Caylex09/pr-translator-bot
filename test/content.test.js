@@ -202,7 +202,7 @@ test('Issue, ordinary Issue comment, Review and inline comment events queue iden
           ...env, TRANSLATION_QUEUE: { send: async value => sent.push(value) },
         }, { waitUntil() { assert.fail('Queueing must not translate source text'); } });
         assert.equal(response.status, 202);
-        assert.deepEqual(sent, [job(kind)]);
+        assert.deepEqual(sent, [{ ...job(kind), version: kind === 'review' || kind === 'review_comment' ? 4 : 3 }]);
         assert.equal(Object.keys(sent[0]).length, kind === 'issue' ? 6 : 7);
         for (const forbidden of ['Cached', 'untrusted.example', secret, privateKey, env.GEMINI_API_KEY,
           'chatgpt-codex-connector']) assert.equal(JSON.stringify(sent[0]).includes(forbidden), false);
