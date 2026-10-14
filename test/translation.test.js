@@ -287,6 +287,130 @@ test('network errors, invalid response JSON, and invalid translation schemas fal
   }
 });
 
+const reviewBody = `## Review
+This change returns the cached token before checking whether the application installation has permission to write comments.
+
+<details><summary>Additional context</summary>
+
+Please validate the installation permissions before the existing token is used. Keep \`issues:write\` and [the API documentation](https://docs.example.test/api) available for the caller.
+
+\`\`\`js
+return cachedToken;
+\`\`\`
+</details>`;
+const translatedReview = {
+  sourceLanguage: 'en', title: '',
+  body: `## 审查
+这项修改在检查应用安装是否拥有写入评论的权限之前，返回了缓存的令牌。
+
+<details><summary>补充说明</summary>
+
+请先验证安装权限，再使用已有令牌。保留 \`issues:write\`，并让调用者可以查阅 [API 文档](https://docs.example.test/api)。
+
+\`\`\`js
+return cachedToken;
+\`\`\`
+</details>`,
+};
+
+test('a copied Codex-style English review falls back rather than being posted as a translation', async t => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async url => {
+    calls.push(String(url));
+    return calls.length === 1
+      ? asJson(geminiAnswer({ sourceLanguage: 'en', title: '', body: reviewBody }))
+      : asJson(chatAnswer(translatedReview));
+  });
+  assert.deepEqual(await translate(providers(primary, secondary), '', reviewBody), translatedReview);
+  assert.equal(calls.length, 2);
+  assert.match(calls[1], /backup\.example/);
+});
+
+test('English paraphrases without Chinese are also retryable non-translations', async t => {
+  const answer = { sourceLanguage: 'en', title: '', body: 'The cached token is returned before the installation permissions are checked, so this needs to be changed.' };
+  t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
+  await assert.rejects(translate(providers(primary), '', reviewBody, { executionMode: 'queue' }), error =>
+    error instanceof TranslationFailure && error.retryable && /contains no Chinese prose/.test(error.message));
+});
+
+test('all providers copying prose leave a retryable failure without exposing the source', async t => {
+  const privateBody = `${reviewBody}\nThis additional sentence contains private-review-details.`;
+  let attempts = 0;
+  const answer = { sourceLanguage: 'en', title: '', body: privateBody };
+  t.mock.method(globalThis, 'fetch', async () => ++attempts === 1
+    ? asJson(geminiAnswer(answer)) : asJson(chatAnswer(answer)));
+  await assert.rejects(translate(providers(primary, secondary), '', privateBody, { executionMode: 'queue' }), error => {
+    assert.ok(error instanceof TranslationFailure);
+    assert.equal(error.retryable, true);
+    assert.match(error.message, /copied source prose unchanged/);
+    assert.ok(!error.message.includes('private-review-details'));
+    return true;
+  });
+  assert.equal(attempts, 2);
+});
+
+test('substantial Chinese prose copied unchanged is rejected as well', async t => {
+  const body = '这项修改在检查应用安装是否拥有写入评论的权限之前，返回了缓存的令牌。请先验证安装权限，再使用已有令牌。';
+  const answer = { sourceLanguage: 'zh', title: '', body };
+  t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
+  await assert.rejects(translate(providers(primary), '', body), error =>
+    error instanceof TranslationFailure && error.retryable && /copied source prose unchanged/.test(error.message));
+});
+
+test('code, links, identifiers, and short labels may remain unchanged', async t => {
+  const body = `\`\`\`text
+The installation has permission to write comments before the cached token is used.
+\`\`\`
+
+~~~text
+The installation has permission to write comments before the cached token is used.
+~~~
+
+\`The installation has permission to write comments before the cached token is used.\`
+https://example.test/the-installation-has-permission-to-write-comments
+@reviewer #42 src/github.js getInstallationToken API HTTP NODE_OPTIONS
+<span data-note="The installation has permission to write comments before the cached token is used.">OK</span>
+<!-- The installation has permission to write comments before the cached token is used. -->`;
+  const answer = { sourceLanguage: 'en', title: 'API', body };
+  t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
+  assert.deepEqual(await translate(providers(primary), 'API', body), answer);
+});
+
+test('indented, quoted, and unclosed fenced code do not need to translate', async t => {
+  const sentence = 'The installation has permission to write comments before the cached token is used.';
+  for (const body of [`    ${sentence}`, `> \`\`\`text\n> ${sentence}\n> \`\`\`\``, `~~~text\n${sentence}`]) {
+    const answer = { sourceLanguage: 'en', title: '', body };
+    t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
+    assert.deepEqual(await translate(providers(primary), '', body), answer);
+    t.mock.restoreAll();
+  }
+});
+
+test('already target-language portions do not need to change', async t => {
+  const cases = [
+    {
+      title: 'Review', body: '这项修改在检查应用安装是否拥有写入评论的权限之前，返回了缓存的令牌。请先验证安装权限，再使用已有令牌。',
+      answer: { sourceLanguage: 'en', title: '审查', body: '这项修改在检查应用安装是否拥有写入评论的权限之前，返回了缓存的令牌。请先验证安装权限，再使用已有令牌。' },
+    },
+    {
+      title: '审查', body: 'Please validate the installation permissions before the existing token is used by the application to write comments.',
+      answer: { sourceLanguage: 'zh', title: 'Review', body: 'Please validate the installation permissions before the existing token is used by the application to write comments.' },
+    },
+  ];
+  for (const { title, body, answer } of cases) {
+    t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
+    assert.deepEqual(await translate(providers(primary), title, body), answer);
+    t.mock.restoreAll();
+  }
+});
+
+test('Chinese inside preserved code does not pass as translated English prose', async t => {
+  const answer = { sourceLanguage: 'en', title: '', body: 'The cached token is returned before the installation permissions are checked.\n```js\nconst label = "中文";\n```' };
+  t.mock.method(globalThis, 'fetch', async () => asJson(geminiAnswer(answer)));
+  await assert.rejects(translate(providers(primary), '', reviewBody), error =>
+    error instanceof TranslationFailure && error.retryable && /contains no Chinese prose/.test(error.message));
+});
+
 test('a JSON code fence around model output is accepted', async t => {
   t.mock.method(globalThis, 'fetch', async () => asJson({
     choices: [{ message: { content: `\n\x60\x60\x60json\n${JSON.stringify(translation)}\n\x60\x60\x60\n` } }],

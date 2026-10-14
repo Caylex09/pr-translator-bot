@@ -85,7 +85,7 @@ function message(value, attempts = 1) {
 function mockRemote(t, kind, options = {}) {
   const remote = {
     calls: [], modelInputs: [], logs: [], reads: {}, comments: structuredClone(options.comments || []),
-    deadLetters: [], source: kind === 'issue'
+    deadLetters: [], threadComments: structuredClone(options.threadComments || []), source: kind === 'issue'
       ? { number: 42, state: 'open', title: 'Current issue title', body: 'Current issue description', ...options.source }
       : { id: sourceIds[kind], body: 'Current source: keep `calculate()` and Markdown.',
         issue_url: 'https://api.github.com/repos/example-owner/demo/issues/42',
@@ -117,7 +117,7 @@ function mockRemote(t, kind, options = {}) {
       assert.equal(verify('RSA-SHA256', Buffer.from(`${header}.${claims}`), publicKey,
         Buffer.from(signature, 'base64url')), true);
       return json({ token: 'content-test-installation-token',
-        permissions: options.permissions || { issues: 'write', pull_requests: 'write' } });
+        permissions: Object.hasOwn(options, 'permissions') ? options.permissions : { issues: 'write', pull_requests: 'write' } });
     }
     assert.equal(new Headers(init.headers).get('authorization'), 'Bearer content-test-installation-token');
     remote.reads[path] = (remote.reads[path] || 0) + 1;
@@ -149,6 +149,29 @@ function mockRemote(t, kind, options = {}) {
     if (path === '/repos/example-owner/demo/issues/comments/400') {
       assert.equal(method, 'PATCH');
       const result = remote.comments.find(value => value.id === 400);
+      assert.ok(result);
+      result.body = JSON.parse(init.body).body;
+      return json(result);
+    }
+    if (path === '/repos/example-owner/demo/pulls/42/comments') {
+      assert.equal(method, 'GET');
+      return json(options.threadPage ? options.threadPage(Number(parsed.searchParams.get('page')), remote) : remote.threadComments);
+    }
+    if (path === '/repos/example-owner/demo/pulls/comments/88') {
+      assert.equal(method, 'GET');
+      return json(options.root || { id: 88, body: 'Thread root',
+        pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' });
+    }
+    if (/^\/repos\/example-owner\/demo\/pulls\/42\/comments\/\d+\/replies$/.test(path)) {
+      assert.equal(method, 'POST');
+      const result = { id: 500, body: JSON.parse(init.body).body, user: { type: 'Bot' },
+        in_reply_to_id: Number(path.split('/').at(-2)) };
+      remote.threadComments.push(result);
+      return json(result, 201);
+    }
+    if (path === '/repos/example-owner/demo/pulls/comments/500') {
+      assert.equal(method, 'PATCH');
+      const result = remote.threadComments.find(value => value.id === 500);
       assert.ok(result);
       result.body = JSON.parse(init.body).body;
       return json(result);
@@ -266,18 +289,136 @@ test('each new consumer translates fresh content and links comments back to thei
       assert.deepEqual(remote.modelInputs, [{ title: kind === 'issue' ? original.title : '', body: original.body }]);
       assert.equal(remote.reads[paths[kind]], 2);
       assert.deepEqual(remote.source, original);
-      assert.equal(remote.comments.length, 1);
-      assert.ok(remote.comments[0].body.startsWith(`${markers[kind]}\n`));
-      assert.match(remote.comments[0].body, /最新译文/);
-      if (kind === 'issue') assert.match(remote.comments[0].body, /译文标题/);
-      else assert.ok(remote.comments[0].body.includes(`(${urls[kind]})`));
-      assert.doesNotMatch(remote.comments[0].body, /untrusted\.example|Cached|Container title/);
-      assert.deepEqual(writes(remote, 'POST'), [{ path: '/repos/example-owner/demo/issues/42/comments', method: 'POST' }]);
+      const translations = kind === 'review_comment' ? remote.threadComments : remote.comments;
+      assert.equal(translations.length, 1);
+      assert.ok(translations[0].body.startsWith(`${markers[kind]}\n`));
+      assert.match(translations[0].body, /最新译文/);
+      if (kind === 'issue') assert.match(translations[0].body, /译文标题/);
+      else assert.ok(translations[0].body.includes(`(${urls[kind]})`));
+      assert.doesNotMatch(translations[0].body, /untrusted\.example|Cached|Container title/);
+      assert.deepEqual(writes(remote, 'POST'), [{ path: kind === 'review_comment'
+        ? '/repos/example-owner/demo/pulls/42/comments/77/replies' : '/repos/example-owner/demo/issues/42/comments', method: 'POST' }]);
       assert.equal(writes(remote, 'PATCH').length, 0);
       acknowledged(msg);
       assert.deepEqual(remote.deadLetters, []);
     });
   }
+});
+
+test('inline translations stay in the original thread and are updated instead of duplicated', async t => {
+  const remote = mockRemote(t, 'review_comment', { source: { in_reply_to_id: 88 } });
+  for (let iteration = 0; iteration < 2; iteration++) {
+    const msg = message(job('review_comment'));
+    await app.queue({ messages: [msg] }, remote.bindings);
+    acknowledged(msg);
+  }
+  assert.deepEqual(writes(remote, 'POST'), [{ path: '/repos/example-owner/demo/pulls/42/comments/88/replies', method: 'POST' }]);
+  assert.equal(remote.comments.length, 0);
+  assert.equal(remote.threadComments.length, 1);
+  assert.equal(remote.threadComments[0].in_reply_to_id, 88);
+  assert.match(remote.threadComments[0].body, /#discussion_r77/);
+  assert.match(remote.threadComments[0].body, /\[Thread\].*#discussion_r88/);
+  assert.equal(writes(remote, 'PATCH').length, 0);
+  remote.source.body = 'Edited inline reply';
+  const edited = message(job('review_comment'));
+  await app.queue({ messages: [edited] }, remote.bindings);
+  // A stable translation does not cause a second notification.
+  assert.equal(writes(remote, 'PATCH').length, 0);
+  acknowledged(edited);
+});
+
+test('an edited inline source patches only its translation in the correct thread', async t => {
+  const remote = mockRemote(t, 'review_comment', { source: { in_reply_to_id: 88 }, threadComments: [
+    { id: 499, body: `${markers.review_comment}\nWrong thread`, in_reply_to_id: 99, user: { type: 'Bot' } },
+    { id: 500, body: `${markers.review_comment}\nOld translation`, in_reply_to_id: 88, user: { type: 'Bot' } },
+    { id: 501, body: '<!-- pr-translator-bot:review-comment:v1:770 -->\nOther source', in_reply_to_id: 88, user: { type: 'Bot' } },
+  ] });
+  const msg = message(job('review_comment'));
+  await app.queue({ messages: [msg] }, remote.bindings);
+  assert.deepEqual(writes(remote, 'PATCH'), [{ path: '/repos/example-owner/demo/pulls/comments/500', method: 'PATCH' }]);
+  assert.match(remote.threadComments[0].body, /Wrong thread/);
+  assert.match(remote.threadComments[2].body, /Other source/);
+  assert.equal(writes(remote, 'POST').length, 0);
+  acknowledged(msg);
+});
+
+test('inline metadata uses the original reviewed location and safe file text after newer pushes', async t => {
+  const commit = 'c6907a4f203a3d0520dc584e2aedee9f3bdd8268';
+  const remote = mockRemote(t, 'review_comment', { source: {
+    original_commit_id: commit, original_start_line: 14, original_line: 16,
+    line: null, path: 'src/[name]`<script>&.js', pull_request_review_id: 66,
+  }, model: current => {
+    current.source.user.login = 'updated-author';
+    return geminiAnswer();
+  } });
+  const msg = message(job('review_comment'));
+  await app.queue({ messages: [msg] }, remote.bindings);
+  const body = remote.threadComments[0].body;
+  assert.match(body, /Author: <code>updated-author<\/code>/);
+  assert.ok(body.includes(`https://github.com/example-owner/demo/commit/${commit}`));
+  assert.match(body, /Original line: 14–16 · Outdated location/);
+  assert.match(body, /#pullrequestreview-66/);
+  assert.ok(body.includes('<code>src/[name]`&lt;script&gt;&amp;.js</code>'));
+  assert.doesNotMatch(body, /<script>/);
+  acknowledged(msg);
+});
+
+test('review translations identify the actual author and reviewed commit', async t => {
+  const commit = '7c8f7c2155a049b10656bb98c3eed8ede3911c88';
+  const remote = mockRemote(t, 'review', { source: { commit_id: commit } });
+  const msg = message(job('review'));
+  await app.queue({ messages: [msg] }, remote.bindings);
+  assert.match(remote.comments[0].body, /chatgpt-codex-connector\[bot\]/);
+  assert.match(remote.comments[0].body, /Reviewed commit 7c8f7c2155/);
+  assert.ok(remote.comments[0].body.includes(`/commit/${commit}`));
+  assert.match(remote.comments[0].body, /#pullrequestreview-66/);
+  acknowledged(msg);
+});
+
+test('a missing or mismatched root cannot redirect a reply to another review thread', async t => {
+  for (const root of [null,
+    { id: 88, pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/43' },
+    { id: 88, pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42', in_reply_to_id: 99 },
+  ]) await t.test(JSON.stringify(root), async subtest => {
+    const remote = mockRemote(subtest, 'review_comment', { source: { in_reply_to_id: 88 },
+      root: root || { id: 0 } });
+    const msg = message(job('review_comment'));
+    await app.queue({ messages: [msg] }, remote.bindings);
+    assert.equal(writes(remote, 'POST').length, 0);
+    acknowledged(msg);
+  });
+});
+
+test('inline replies require approved Pull requests write permission before calling a model', async t => {
+  const remote = mockRemote(t, 'review_comment', { permissions: { issues: 'write', pull_requests: 'read' } });
+  const msg = message(job('review_comment'));
+  await app.queue({ messages: [msg] }, remote.bindings);
+  assert.equal(remote.modelInputs.length, 0);
+  assert.equal(writes(remote, 'POST').length, 0);
+  assert.match(remote.logs.join('\n'), /requires Pull requests write/);
+  assert.deepEqual(remote.deadLetters, [job('review_comment')]);
+  acknowledged(msg);
+});
+
+test('inline translation lookup follows pages and does not duplicate a source beyond its scan limit', async t => {
+  await t.test('translation on a later page', async subtest => {
+    const translation = { id: 500, body: `${markers.review_comment}\nOld`, in_reply_to_id: 77, user: { type: 'Bot' } };
+    const remote = mockRemote(subtest, 'review_comment', { threadComments: [translation], threadPage: page =>
+      page === 1 ? Array.from({ length: 100 }, (_, index) => ({ id: index + 1000, body: 'Unrelated' })) : [translation] });
+    const msg = message(job('review_comment'));
+    await app.queue({ messages: [msg] }, remote.bindings);
+    assert.equal(writes(remote, 'POST').length, 0);
+    assert.equal(writes(remote, 'PATCH').length, 1);
+    acknowledged(msg);
+  });
+  await t.test('500 entries without finding the source', async subtest => {
+    const remote = mockRemote(subtest, 'review_comment', { threadPage: () => Array.from({ length: 100 }, (_, index) => ({ id: index + 1000, body: 'Unrelated' })) });
+    const msg = message(job('review_comment'));
+    await app.queue({ messages: [msg] }, remote.bindings);
+    assert.equal(writes(remote, 'POST').length, 0);
+    assert.deepEqual(remote.deadLetters, [job('review_comment')]);
+    acknowledged(msg);
+  });
 });
 
 test('an Issue with a title and no description still produces a title translation', async t => {
@@ -423,8 +564,9 @@ test('source edits during translation retry fresh content and never publish the 
       await app.queue({ messages: [retry] }, remote.bindings);
       assert.equal(remote.modelInputs[1].body, 'Newest source after edit');
       if (kind === 'issue') assert.equal(remote.modelInputs[1].title, 'Newest issue title');
-      assert.match(remote.comments[0].body, /编辑后的最新译文/);
-      assert.doesNotMatch(remote.comments[0].body, /Stale result/);
+      const translation = kind === 'review_comment' ? remote.threadComments[0] : remote.comments[0];
+      assert.match(translation.body, /编辑后的最新译文/);
+      assert.doesNotMatch(translation.body, /Stale result/);
       acknowledged(retry);
     });
   }

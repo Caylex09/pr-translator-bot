@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { Miniflare } from 'miniflare';
 
-async function nativeQueueScenario(isComment = false, contentKind) {
+async function nativeQueueScenario(isComment = false, contentKind, isInlineReply = false) {
   const bodyOnly = isComment || (contentKind && contentKind !== 'issue');
   const issueContainer = contentKind === 'issue' || contentKind === 'issue_comment';
   const sourceId = contentKind === 'review' ? 66 : contentKind === 'review_comment' ? 77 : 55;
@@ -46,7 +46,7 @@ async function nativeQueueScenario(isComment = false, contentKind) {
           assert.equal(JSON.parse(Buffer.from(parts[1], 'base64url')).iss, '456');
           assert.equal(verify('RSA-SHA256', Buffer.from(`${parts[0]}.${parts[1]}`),
             publicKey, Buffer.from(parts[2], 'base64url')), true);
-          return Response.json({ token, permissions: { issues: 'write', pull_requests: 'read' } });
+          return Response.json({ token, permissions: { issues: 'write', pull_requests: contentKind === 'review_comment' ? 'write' : 'read' } });
         }
         assert.equal(request.headers.get('authorization'), `Bearer ${token}`);
         if (contentKind && url.pathname === '/repos/example-owner/demo') {
@@ -76,7 +76,24 @@ async function nativeQueueScenario(isComment = false, contentKind) {
         }
         if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/comments/77') {
           return Response.json({ id: 77, body: originalComment,
+            ...(isInlineReply ? { in_reply_to_id: 88 } : {}),
             pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' });
+        }
+        if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/comments/88') {
+          assert.equal(request.method, 'GET');
+          return Response.json({ id: 88, body: 'Thread root',
+            pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' });
+        }
+        if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/42/comments') {
+          assert.equal(request.method, 'GET');
+          return Response.json([]);
+        }
+        if (contentKind === 'review_comment' && url.pathname === `/repos/example-owner/demo/pulls/42/comments/${isInlineReply ? 88 : 77}/replies`) {
+          assert.equal(request.method, 'POST');
+          postedComment = (await request.json()).body;
+          resolvePosted();
+          return Response.json({ id: 100, body: postedComment, user: { type: 'Bot' },
+            in_reply_to_id: isInlineReply ? 88 : 77 }, { status: 201 });
         }
         if (url.pathname === '/repos/example-owner/demo/issues/42/comments') {
           if (request.method === 'GET') return Response.json([]);
@@ -208,8 +225,14 @@ async function nativeQueueScenario(isComment = false, contentKind) {
         ...(contentKind === 'issue' ? [] : [sourcePath]),
         'POST generativelanguage.googleapis.com/v1beta/models/runtime-model:generateContent',
         sourcePath, ...(contentKind === 'issue' ? [] : [containerPath]), repositoryPath,
+        ...(contentKind === 'review_comment' ? [
+          ...(isInlineReply ? ['GET api.github.com/repos/example-owner/demo/pulls/comments/88'] : []),
+          'GET api.github.com/repos/example-owner/demo/pulls/42/comments',
+        ] : []),
         'GET api.github.com/repos/example-owner/demo/issues/42/comments',
-        'POST api.github.com/repos/example-owner/demo/issues/42/comments',
+        contentKind === 'review_comment'
+          ? `POST api.github.com/repos/example-owner/demo/pulls/42/comments/${isInlineReply ? 88 : 77}/replies`
+          : 'POST api.github.com/repos/example-owner/demo/issues/42/comments',
       ]);
     } else assert.deepEqual(calls, [
       'POST api.github.com/app/installations/123/access_tokens',
@@ -234,3 +257,4 @@ test('workerd translates another bot discussion comment through its native queue
 for (const kind of ['issue', 'issue_comment', 'review', 'review_comment']) {
   test(`workerd handles ${kind} through its native queue consumer`, { timeout: 20000 }, () => nativeQueueScenario(false, kind));
 }
+test('workerd translates an inline reply in its root review thread', { timeout: 20000 }, () => nativeQueueScenario(false, 'review_comment', true));

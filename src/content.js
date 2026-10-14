@@ -1,5 +1,5 @@
 import { translate } from './translation.js';
-import { GitHubFailure, getInstallationToken, github, findBotComment } from './github.js';
+import { GitHubFailure, getInstallationToken, github, findBotComment, findBotReviewComment } from './github.js';
 
 const GITHUB_API = 'https://api.github.com';
 const MAX_CONTENT_CHARS = 12000;
@@ -132,7 +132,42 @@ function pathsFor(job) {
   return { repository, container, source };
 }
 
-function renderTranslation(job, translated, truncated) {
+function positiveId(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+function htmlText(value) {
+  return text(value).replace(/[&<>]/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[character]));
+}
+
+export function sourceContext(job, source) {
+  const context = [];
+  if (text(source.user?.login)) context.push(`Author: <code>${htmlText(source.user.login)}</code>`);
+  if (job.kind === 'review' || job.kind === 'review_comment') {
+    const commit = job.kind === 'review_comment' ? source.original_commit_id : source.commit_id;
+    if (typeof commit === 'string' && /^[a-f0-9]{40}$/i.test(commit)) {
+      context.push(`[Reviewed commit ${commit.slice(0, 10)}](https://github.com/${job.owner}/${job.repo}/commit/${commit})`);
+    }
+  }
+  if (job.kind === 'review_comment') {
+    if (text(source.path)) context.push(`File: <code>${htmlText(source.path)}</code>`);
+    // Original coordinates remain associated with the reviewed commit even after new pushes.
+    if (positiveId(source.original_line)) {
+      const start = positiveId(source.original_start_line) ? `${source.original_start_line}–` : '';
+      context.push(`Original line: ${start}${source.original_line}`);
+    }
+    if (source.line === null && positiveId(source.original_line)) context.push('Outdated location');
+    if (positiveId(source.pull_request_review_id)) {
+      context.push(`[Review #${source.pull_request_review_id}](https://github.com/${job.owner}/${job.repo}/pull/${job.number}#pullrequestreview-${source.pull_request_review_id})`);
+    }
+    if (positiveId(source.in_reply_to_id)) {
+      context.push(`[Thread](https://github.com/${job.owner}/${job.repo}/pull/${job.number}#discussion_r${source.in_reply_to_id})`);
+    }
+  }
+  return context.length ? `\n\n<sub>${context.join(' · ')}</sub>` : '';
+}
+
+function renderTranslation(job, translated, truncated, source) {
   const { kind, owner, repo, number, sourceId } = job;
   const direction = translated.sourceLanguage === 'zh' ? '中文 → English' : 'English → 中文';
   const markerKind = kind === 'issue_comment' ? 'issue-comment'
@@ -154,7 +189,7 @@ function renderTranslation(job, translated, truncated) {
       : kind === 'review_comment' ? `discussion_r${sourceId}` : `issuecomment-${sourceId}`;
     const containerType = kind === 'issue_comment' ? 'issues' : 'pull';
     const sourceUrl = `https://github.com/${owner}/${repo}/${containerType}/${number}#${anchor}`;
-    content = `[${isReview ? 'Original review' : 'Original comment'}](${sourceUrl})\n\n${translated.body}`;
+    content = `[${isReview ? 'Original review' : 'Original comment'}](${sourceUrl})${sourceContext(job, source)}\n\n${translated.body}`;
     originalLabel = isReview ? 'review' : 'comment';
   }
   const note = truncated
@@ -170,7 +205,7 @@ export async function processContentJob(job, env, options = {}) {
   if (!SOURCE_KINDS.has(job.kind)) throw new Error('Invalid content translation kind');
   const { owner, repo, number, installationId, kind } = job;
   const paths = pathsFor(job);
-  const token = await getInstallationToken(env, installationId);
+  const token = await getInstallationToken(env, installationId, { requirePullRequestsWrite: kind === 'review_comment' });
   if (!repositoryEligible(await github(token, paths.repository), env)) return;
   const container = await getIfPresent(token, paths.container);
   if (!containerEligible(container, job, env)) return;
@@ -200,7 +235,38 @@ export async function processContentJob(job, env, options = {}) {
   if (!containerEligible(currentContainer, job, env)) return;
   if (!repositoryEligible(await github(token, paths.repository), env)) return;
 
-  const comment = renderTranslation(job, translated, originalBody.length > MAX_CONTENT_CHARS);
+  const comment = renderTranslation(job, translated, originalBody.length > MAX_CONTENT_CHARS, currentSource);
+  if (kind === 'review_comment') {
+    const rootId = positiveId(currentSource.in_reply_to_id) ? currentSource.in_reply_to_id : job.sourceId;
+    if (rootId !== job.sourceId) {
+      const root = await getIfPresent(token, `/repos/${owner}/${repo}/pulls/comments/${rootId}`);
+      if (!sourceMatches(root, { ...job, sourceId: rootId }) || positiveId(root.in_reply_to_id)) {
+        console.info('Content translation skipped: review thread is missing or belongs elsewhere');
+        return;
+      }
+    }
+    const threadTranslation = await findBotReviewComment(token, owner, repo, number, comment.marker, rootId);
+    if (threadTranslation) {
+      if (threadTranslation.body !== comment.body) {
+        await github(token, `/repos/${owner}/${repo}/pulls/comments/${threadTranslation.id}`, 'PATCH', { body: comment.body });
+        console.info('Review thread translation updated');
+      } else console.info('Review thread translation unchanged');
+      return;
+    }
+    // Existing releases posted inline translations into Conversation. Keep updating
+    // those in place; migration must not duplicate or delete published comments.
+    const legacyTranslation = await findBotComment(token, owner, repo, number, comment.marker);
+    if (legacyTranslation) {
+      if (legacyTranslation.body !== comment.body) {
+        await github(token, `/repos/${owner}/${repo}/issues/comments/${legacyTranslation.id}`, 'PATCH', { body: comment.body });
+        console.info('Legacy review translation updated');
+      } else console.info('Legacy review translation unchanged');
+      return;
+    }
+    await github(token, `/repos/${owner}/${repo}/pulls/${number}/comments/${rootId}/replies`, 'POST', { body: comment.body });
+    console.info('Review thread translation created');
+    return;
+  }
   const existing = await findBotComment(token, owner, repo, number, comment.marker);
   if (existing) {
     if (existing.body !== comment.body) {

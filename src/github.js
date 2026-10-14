@@ -83,7 +83,7 @@ async function githubRequest(url, options, service) {
   }
 }
 
-export async function getInstallationToken(env, installationId) {
+export async function getInstallationToken(env, installationId, { requirePullRequestsWrite = false } = {}) {
   const jwt = await createAppJwt(env);
   const result = await githubRequest(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
     method: 'POST',
@@ -97,11 +97,17 @@ export async function getInstallationToken(env, installationId) {
   if (!result || typeof result.token !== 'string' || !result.token) {
     throw new GitHubFailure('GitHub installation token: missing token', true);
   }
+  if (requirePullRequestsWrite && (!result.permissions || typeof result.permissions !== 'object' || Array.isArray(result.permissions))) {
+    throw new GitHubFailure('GitHub installation token: missing permissions for review replies', true);
+  }
   if (result.permissions && typeof result.permissions === 'object' && !Array.isArray(result.permissions)) {
     const issues = ['read', 'write'].includes(result.permissions.issues) ? result.permissions.issues : 'none';
     const pullRequests = ['read', 'write'].includes(result.permissions.pull_requests)
       ? result.permissions.pull_requests : 'none';
     console.info(`GitHub installation permissions: issues=${issues}, pull_requests=${pullRequests}`);
+    if (requirePullRequestsWrite && pullRequests !== 'write') {
+      throw new GitHubFailure('GitHub App installation requires Pull requests write permission to reply in review threads; approve updated installation permissions', false);
+    }
     if (issues !== 'write' && pullRequests !== 'write') {
       throw new GitHubFailure('GitHub App installation requires Issues or Pull requests write permission; approve updated installation permissions', false);
     }
@@ -133,4 +139,17 @@ export async function findBotComment(token, owner, repo, number, marker = PR_MAR
     if (comments.length < 100) break;
   }
   return null;
+}
+
+export async function findBotReviewComment(token, owner, repo, number, marker, rootId) {
+  for (let page = 1; page <= 5; page++) {
+    const comments = await github(token,
+      `/repos/${owner}/${repo}/pulls/${number}/comments?per_page=100&page=${page}`);
+    const matching = comments.find(c => c.user?.type === 'Bot'
+      && c.body?.startsWith(marker) && c.in_reply_to_id === rootId);
+    if (matching) return matching;
+    if (comments.length < 100) return null;
+  }
+  // Do not create a duplicate when the existing translation may be beyond the limit.
+  throw new GitHubFailure('Review translation lookup exceeds 500 comments', false);
 }

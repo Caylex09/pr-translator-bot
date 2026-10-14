@@ -2,7 +2,7 @@
 // Translates PRs, Issues, their comments, and PR review text.
 import { translate } from './translation.js';
 import { createAppJwt, getInstallationToken, github, GitHubFailure, findBotComment } from './github.js';
-import { processContentJob } from './content.js';
+import { processContentJob, sourceContext } from './content.js';
 
 const encoder = new TextEncoder();
 const MARKER = '<!-- pr-translator-bot:v1 -->';
@@ -342,7 +342,7 @@ async function processComment(job, env, options = {}) {
   const note = truncated
     ? `\n\n> Note: Only the first ${MAX_DESCRIPTION_CHARS} characters of the original comment were translated.\n`
     : '';
-  const comment = `${marker}\n### Automatic comment translation · ${direction}\n\n[Original comment](${sourceUrl})\n\n${translated.body}${note}\n\n---\n<sub>Generated automatically by PR Translator Bot. Original comment remains unchanged.</sub>`;
+  const comment = `${marker}\n### Automatic comment translation · ${direction}\n\n[Original comment](${sourceUrl})${sourceContext(job, currentSource)}\n\n${translated.body}${note}\n\n---\n<sub>Generated automatically by PR Translator Bot. Original comment remains unchanged.</sub>`;
   const existing = await findBotComment(token, owner, repo, number, marker);
   if (existing) {
     if (existing.body !== comment) {
