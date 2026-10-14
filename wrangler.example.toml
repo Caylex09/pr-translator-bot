@@ -1,0 +1,34 @@
+name = "pr-translator-bot"
+main = "src/index.js"
+compatibility_date = "2026-10-13"
+workers_dev = true
+
+[vars]
+# Required: replace with the GitHub user or organization that owns the repositories.
+TARGET_OWNER = "your-github-owner"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
+ALLOW_PRIVATE = "false"
+
+# Leave empty for the default single-Gemini setup.
+# For relay APIs or failover, set an ordered JSON array; see the README.
+# Store all API keys in Worker Secrets, never in this file.
+TRANSLATION_PROVIDERS = ""
+# Shared translation budget per queue attempt: 1000-120000 milliseconds.
+TRANSLATION_TIMEOUT_MS = "60000"
+
+[[queues.producers]]
+binding = "TRANSLATION_QUEUE"
+queue = "pr-translator-jobs"
+
+[[queues.producers]]
+binding = "TRANSLATION_DLQ"
+queue = "pr-translator-dead-letter"
+
+[[queues.consumers]]
+queue = "pr-translator-jobs"
+max_batch_size = 1
+max_batch_timeout = 1
+max_concurrency = 1
+max_retries = 3
+retry_delay = 30
+dead_letter_queue = "pr-translator-dead-letter"

@@ -1,0 +1,20 @@
+node_modules/
+.wrangler/
+
+# Local deployment configuration; commit wrangler.example.toml instead.
+wrangler.toml
+
+# Local credentials and private keys.
+.dev.vars*
+!.dev.vars.example
+.env*
+*.pem
+*.key
+
+# Logs and generated publication bundles.
+*.log
+release/
+
+# Operating-system metadata.
+.DS_Store
+Thumbs.db

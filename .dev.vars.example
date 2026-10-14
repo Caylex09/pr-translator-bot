@@ -1,0 +1,17 @@
+# Local development secrets. Copy this file to .dev.vars and fill in the variables you use.
+# Configure production values with `npx wrangler secret put <NAME>` instead.
+GITHUB_APP_ID="replace-with-your-github-app-id"
+GITHUB_WEBHOOK_SECRET="replace-with-your-webhook-secret"
+# Use the full PKCS#8 PEM key; literal \n sequences represent line breaks.
+GITHUB_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nREPLACE_WITH_PKCS8_KEY_CONTENT\n-----END PRIVATE KEY-----"
+
+# Required for the default single-Gemini setup, or when listed in api_key_env.
+GEMINI_API_KEY="replace-with-your-gemini-api-key"
+
+# Optional: uncomment and fill in each secret referenced by your provider list.
+# These names match the README relay example and translation-providers.example.json.
+# RELAY_API_KEY="replace-with-relay-api-key"
+# OPENAI_PRIMARY_API_KEY="replace-with-primary-site-api-key"
+# OPENAI_BACKUP_API_KEY="replace-with-backup-site-api-key"
+# ANTHROPIC_API_KEY="replace-with-your-anthropic-api-key"
+# RESPONSES_API_KEY="replace-with-your-responses-api-key"
