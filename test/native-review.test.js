@@ -44,6 +44,13 @@ const json = (value, status = 200) => new Response(JSON.stringify(value), {
 });
 const gemini = value => json({ candidates: [{ content: { parts: [{ text: JSON.stringify(value) }] } }] });
 
+// The Review-scoped endpoint uses the compact/legacy comment representation.
+// Line ranges, side and parent-thread IDs come from the PR-scoped endpoint.
+const scopedComment = source => ({ id: source.id, body: source.body, user: source.user,
+  pull_request_review_id: source.pull_request_review_id, pull_request_url: source.pull_request_url,
+  path: source.path, commit_id: source.commit_id, original_commit_id: source.original_commit_id,
+  position: 1, original_position: 1 });
+
 function message(body, attempts = 1) {
   const state = { acknowledgements: 0, retries: [] };
   return { body, attempts, state, ack() { state.acknowledgements++; },
@@ -105,7 +112,7 @@ function remote(t, options = {}) {
     }
     if (path === `${pull}/reviews/66/comments`) {
       assert.equal(method, 'GET');
-      return json(state.roots);
+      return json(state.roots.map(scopedComment));
     }
     if (path === `${pull}/reviews`) {
       if (method === 'GET') return json([state.review, ...state.botReviews]);
@@ -122,7 +129,7 @@ function remote(t, options = {}) {
       assert.equal(method, 'GET');
       const reviewId = Number(path.split('/').at(-2));
       return json(options.reviewComments ? options.reviewComments(reviewId, state)
-        : state.botComments.filter(comment => comment.pull_request_review_id === reviewId));
+        : state.botComments.filter(comment => comment.pull_request_review_id === reviewId).map(scopedComment));
     }
     if (/\/reviews\/\d+$/.test(path)) {
       assert.equal(method, 'PUT');
@@ -133,7 +140,8 @@ function remote(t, options = {}) {
     }
     if (path === `${pull}/comments`) {
       assert.equal(method, 'GET');
-      return json([...state.roots, ...state.replies, ...state.botComments]);
+      return json(options.prComments ? options.prComments(Number(parsed.searchParams.get('page') || 1), state)
+        : [...state.roots, ...state.replies, ...state.botComments]);
     }
     if (/\/pulls\/comments\/\d+$/.test(path)) {
       const id = Number(path.split('/').at(-1));
@@ -255,10 +263,62 @@ test('source thread replies translate below the bot own root and later edits reu
   assert.equal(state.botComments.filter(comment => comment.in_reply_to_id === ownRoot.id).length, 1);
 });
 
+test('a compact reply-only Review is recognized from full parent metadata and creates no root copy', async t => {
+  const state = remote(t, { review: { body: '' }, roots: [root(79, { in_reply_to_id: 77 })] });
+  ack(await consume(state));
+  assert.equal(state.modelInputs.length, 0);
+  assert.equal(state.botReviews.length, 0);
+  assert.deepEqual(state.deadLetters, []);
+});
+
+test('a scoped comment missing from the full list retries and recovers without posting an incomplete Review', async t => {
+  let missing = true;
+  const state = remote(t, { prComments: (_page, value) => missing ? [] : [...value.roots, ...value.botComments] });
+  const first = await consume(state);
+  assert.equal(first.state.acknowledgements, 0);
+  assert.deepEqual(first.state.retries, [{ delaySeconds: 30 }]);
+  assert.equal(state.modelInputs.length, 0);
+  assert.equal(state.botReviews.length, 0);
+  missing = false;
+  ack(await consume(state));
+  assert.equal(state.botReviews.length, 1);
+  assert.equal(state.botComments.length, 2);
+});
+
+test('full review metadata is looked up across PR comment pages', async t => {
+  const filler = Array.from({ length: 100 }, (_, index) => ({ id: 5000 + index }));
+  const state = remote(t, { prComments: (page, value) => page === 1 ? filler : [...value.roots, ...value.botComments] });
+  ack(await consume(state));
+  assert.equal(state.botReviews.length, 1);
+  assert.equal(state.botComments[0].line, 12);
+  assert.equal(state.botComments[0].side, 'RIGHT');
+});
+
+test('full metadata association mismatches cannot publish another Review or PR content', async t => {
+  for (const change of [{ pull_request_review_id: 67 }, { pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/43' }]) {
+    await t.test(JSON.stringify(change), async sub => {
+      const state = remote(sub, { prComments: (_page, value) => value.roots.map(source => ({ ...source, ...change })) });
+      ack(await consume(state));
+      assert.equal(state.modelInputs.length, 0);
+      assert.equal(state.botReviews.length, 0);
+      assert.equal(state.deadLetters.length, 1);
+    });
+  }
+});
+
+test('metadata lookup overflow stops before translation or writes', async t => {
+  const state = remote(t, { prComments: () => Array.from({ length: 100 }, (_, index) => ({ id: 5000 + index })) });
+  ack(await consume(state));
+  assert.equal(state.modelInputs.length, 0);
+  assert.equal(state.botReviews.length, 0);
+  assert.equal(state.deadLetters.length, 1);
+});
+
 test('a delayed new source root uses an explicitly linked supplement Review without duplication', async t => {
   const state = remote(t, { roots: [root()] });
   ack(await consume(state));
   state.roots.push(root(78));
+  const callsBeforeSupplement = state.calls.length;
   ack(await consume(state, job('review_comment', 78)));
   assert.deepEqual(state.modelInputs[1].items.map(item => item.id), ['78']);
   assert.equal(reviewCreates(state).length, 2);
@@ -267,6 +327,8 @@ test('a delayed new source root uses an explicitly linked supplement Review with
   assert.equal(supplement.comments.length, 1);
   assert.match(supplement.comments[0].body, /review-comment:v2:78/);
   assert.equal(supplement.commit_id, commit);
+  assert.equal(state.calls.slice(callsBeforeSupplement).filter(call => call.method === 'GET' && call.path === `${pull}/comments`).length, 4,
+    'Native Review and its supplement share one full-comment index per lookup');
   ack(await consume(state));
   ack(await consume(state, job('review_comment', 78)));
   assert.equal(reviewCreates(state).length, 2);

@@ -12,6 +12,9 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
   const reviewedCommit = '6eca397f2390e75a6309e4fa5a93f0c7e3f7c392';
   const ownReviews = [];
   const ownRoots = [];
+  const compactComment = source => ({ id: source.id, body: source.body, user: source.user,
+    pull_request_review_id: source.pull_request_review_id, pull_request_url: source.pull_request_url,
+    path: source.path, original_commit_id: source.original_commit_id });
   const { privateKey, publicKey } = generateKeyPairSync('rsa', {
     modulusLength: 2048,
     privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
@@ -93,16 +96,19 @@ async function nativeQueueScenario(isComment = false, contentKind, isInlineReply
         }
         if (contentKind === 'review_comment' && url.pathname === '/repos/example-owner/demo/pulls/42/comments') {
           assert.equal(request.method, 'GET');
-          return Response.json(ownRoots);
+          return Response.json([{ id: isInlineReply ? 88 : 77,
+            body: isInlineReply ? 'Thread root' : originalComment, pull_request_review_id: 66,
+            original_commit_id: reviewedCommit, original_line: 33, side: 'RIGHT', path: 'src/example.js',
+            pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' }, ...ownRoots]);
         }
         if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews/66/comments') {
           return Response.json(contentKind === 'review' ? [] : [{ id: isInlineReply ? 88 : 77,
             body: isInlineReply ? 'Thread root' : originalComment, pull_request_review_id: 66,
             original_commit_id: reviewedCommit, original_line: 33, side: 'RIGHT', path: 'src/example.js',
-            pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' }]);
+            pull_request_url: 'https://api.github.com/repos/example-owner/demo/pulls/42' }].map(compactComment));
         }
         if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews/600/comments') {
-          return Response.json(ownRoots);
+          return Response.json(ownRoots.map(compactComment));
         }
         if (ownReview && url.pathname === '/repos/example-owner/demo/pulls/42/reviews') {
           if (request.method === 'GET') return Response.json(ownReviews);

@@ -315,6 +315,43 @@ function hasHash(body, hash) {
   return text(body).split('\n')[1] === `<!-- pr-translator-bot:source:v1:${hash} -->`;
 }
 
+async function expandReviewComments(token, job, reviewId, compact, index = { values: new Map(), page: 1, complete: false }) {
+  if (!compact.length) return [];
+  const wanted = new Set();
+  for (const source of compact) {
+    if (!positiveId(source.id) || source.pull_request_review_id !== reviewId
+      || !sourceMatches(source, { ...job, kind: 'review_comment', sourceId: source.id })) {
+      throw new GitHubFailure('Review comment association is invalid', false);
+    }
+    if (wanted.has(source.id)) throw new GitHubFailure('GitHub review list contains duplicate IDs', true);
+    wanted.add(source.id);
+  }
+  // Review-scoped lists omit line/side/thread fields. Match their IDs against
+  // the complete PR comment representation; never infer coordinates or parents.
+  const resolved = () => Array.from(wanted).every(id => index.values.has(id));
+  while (!resolved() && !index.complete && index.page <= 5) {
+    const values = await github(token,
+      `/repos/${job.owner}/${job.repo}/pulls/${job.number}/comments?per_page=100&page=${index.page++}`);
+    if (!Array.isArray(values)) throw new GitHubFailure('GitHub PR comment list: invalid response', true);
+    for (const source of values) {
+      if (positiveId(source.id)) index.values.set(source.id, source);
+    }
+    if (values.length < 100) index.complete = true;
+  }
+  if (!resolved()) {
+    if (index.complete) throw new GitHubFailure('Review comment changed or was deleted during lookup; retrying', true);
+    throw new GitHubFailure('Review comment metadata lookup exceeds 500 PR comments', false);
+  }
+  return compact.map(source => {
+    const full = index.values.get(source.id);
+    if (full.pull_request_review_id !== reviewId
+      || !sourceMatches(full, { ...job, kind: 'review_comment', sourceId: source.id })) {
+      throw new GitHubFailure('Expanded review comment association is invalid', false);
+    }
+    return full;
+  });
+}
+
 async function readNativeSnapshot(token, job, env) {
   const base = `/repos/${job.owner}/${job.repo}`;
   if (!repositoryEligible(await github(token, base), env)) return null;
@@ -326,7 +363,8 @@ async function readNativeSnapshot(token, job, env) {
   if (!/^[a-f0-9]{40}$/i.test(text(review.commit_id))) {
     throw new GitHubFailure('Source review has no valid reviewed commit', false);
   }
-  const values = await listAll(token, `${base}/pulls/${job.number}/reviews/${job.sourceId}/comments`);
+  const compact = await listAll(token, `${base}/pulls/${job.number}/reviews/${job.sourceId}/comments`);
+  const values = await expandReviewComments(token, job, job.sourceId, compact);
   const roots = [];
   for (const source of values) {
     if (!positiveId(source.id) || !sourceMatches(source, { ...job, kind: 'review_comment', sourceId: source.id })
@@ -350,13 +388,15 @@ async function nativeTranslations(token, job, env) {
     && (text(review.body).startsWith(nativeReviewMarker(job.sourceId))
       || text(review.body).startsWith(`<!-- pr-translator-bot:review-supplement:v1:${job.sourceId}:`)));
   const comments = new Map();
+  const commentIndex = { values: new Map(), page: 1, complete: false };
   for (const review of reviews) {
     const reviewAppId = review.performed_via_github_app?.id;
     if (!positiveId(review.id) || !sourceMatches(review, { ...job, kind: 'review', sourceId: review.id })
       || (reviewAppId !== undefined && String(reviewAppId) !== String(env.GITHUB_APP_ID))) {
       throw new GitHubFailure('Translation review association is invalid', false);
     }
-    for (const comment of await listAll(token, `${base}/reviews/${review.id}/comments`)) {
+    const compact = await listAll(token, `${base}/reviews/${review.id}/comments`);
+    for (const comment of await expandReviewComments(token, job, review.id, compact, commentIndex)) {
       if (comment.user?.type !== 'Bot' || positiveId(comment.in_reply_to_id)) continue;
       const match = text(comment.body).match(/^<!-- pr-translator-bot:review-comment:v2:(\d+) -->\n/);
       if (match) {
